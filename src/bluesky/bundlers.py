@@ -75,25 +75,30 @@ def _describe_collect_dict_is_valid(
 class RunBundler:
     @dataclass
     class _StreamCache:
-        # cache of obj.collect_asset_docs()
-        asset_docs_cache: deque[Asset | StreamAsset] = field(default_factory=deque)
+        """Helper data class that holds all cached data related to devices for a partiuclar stream."""
 
+        # Readable
         # cache of obj.read() in one Event
         read_cache: deque[dict[str, Reading]] = field(default_factory=deque)
         # cache of all obj.describe() output
         describe_cache: ObjDict[DataKey] = field(default_factory=dict)
 
+        # Collectable
         # cache of all obj.describe() output for Collectable object only
-        describe_collect_cache: ObjDict[DataKey | dict[str, DataKey]] = field(default_factory=dict)
+        describe_collect_cache: dict[Any, dict[str, DataKey] | dict[str, dict[str, DataKey]]] = field(
+            default_factory=dict
+        )
 
-        # " obj.describe_configuration()
+        # Configurable
+        # obj.describe_configuration()
         config_desc_cache: ObjDict[DataKey] = field(default_factory=dict)
-        # " obj.read_configuration() values
+        # obj.read_configuration() values
         config_values_cache: ObjDict[Any] = field(default_factory=dict)
-        # " obj.read_configuration() timestamps
+        # obj.read_configuration() timestamps
         config_ts_cache: ObjDict[Any] = field(default_factory=dict)
 
-        def clear_read_cache(self):
+        def clear_readable_cache(self):
+            """Clear the cache of Readable methods so new data can be stored."""
             self.read_cache.clear()
             self.describe_cache.clear()
             self.describe_collect_cache.clear()
@@ -118,6 +123,8 @@ class RunBundler:
 
         self._saved_stream_cache: dict[str, RunBundler._StreamCache] = dict()  # noqa: C408
         self._current_stream_cache: RunBundler._StreamCache = RunBundler._StreamCache()
+
+        self._asset_docs_cache: deque[Asset | StreamAsset] = deque()  # cache of obj.collect_asset_docs()
 
         # cache of {name: (doc, compose_event, compose_event_page)}
         self._descriptors: dict[Any, ComposeDescriptorBundle] = dict()  # noqa: C408
@@ -349,8 +356,7 @@ class RunBundler:
                 "bundle is closed with a 'save' or "
                 "'drop' message."
             )
-        # self._current_stream_cache = RunBundler._StreamCache()
-        # self._saved_stream_cache.clear()
+        self._asset_docs_cache.clear()
         self._objs_read.clear()
         self.bundling = True
         command, obj, args, kwargs, _ = msg
@@ -371,7 +377,7 @@ class RunBundler:
         stream_name = self._bundle_name
         if stream_name in self._saved_stream_cache:
             self._current_stream_cache = self._saved_stream_cache[stream_name]
-            self._current_stream_cache.clear_read_cache()
+            self._current_stream_cache.clear_readable_cache()
         else:
             self._current_stream_cache = RunBundler._StreamCache()
             self._saved_stream_cache[stream_name] = self._current_stream_cache
@@ -417,7 +423,7 @@ class RunBundler:
             # and cache them as well. Likewise, these will be emitted if and
             # when _save is called.
             asset_docs_collected = [x async for x in maybe_collect_asset_docs(msg, obj, *msg.args, **msg.kwargs)]
-            self._current_stream_cache.asset_docs_cache.extend(asset_docs_collected)
+            self._asset_docs_cache.extend(asset_docs_collected)
 
         return reading
 
@@ -611,9 +617,7 @@ class RunBundler:
             raise RuntimeError(f"Mismatched objects read, expected {frozenset(d_objs)!s}, got {objs_read!s}")
 
         # Resource and Datum documents
-        indices_generated = await self._pack_external_assets(
-            self._current_stream_cache.asset_docs_cache, message_stream_name=desc_key
-        )
+        indices_generated = await self._pack_external_assets(self._asset_docs_cache, message_stream_name=desc_key)
         if indices_generated > 1:
             raise RuntimeError(
                 "Received multiple indices in a `stream_datum` document for one event, "
