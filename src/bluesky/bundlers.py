@@ -3,6 +3,7 @@ import inspect
 import time as ttime
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from itertools import combinations
 from logging import LoggerAdapter
 from typing import Any, Literal, TypeAlias, TypeGuard, cast
@@ -72,6 +73,26 @@ def _describe_collect_dict_is_valid(
 
 
 class RunBundler:
+    @dataclass
+    class _StreamCache:
+        # cache of obj.collect_asset_docs()
+        asset_docs_cache: deque[Asset | StreamAsset] = field(default_factory=deque)
+
+        # cache of obj.read() in one Event
+        read_cache: deque[dict[str, Reading]] = field(default_factory=deque)
+        # cache of all obj.describe() output
+        describe_cache: ObjDict[DataKey] = field(default_factory=dict)
+
+        # cache of all obj.describe() output for Collectable object only
+        describe_collect_cache: ObjDict[DataKey | dict[str, DataKey]] = field(default_factory=dict)
+
+        # " obj.describe_configuration()
+        config_desc_cache: ObjDict[DataKey] = field(default_factory=dict)
+        # " obj.read_configuration() values
+        config_values_cache: ObjDict[Any] = field(default_factory=dict)
+        # " obj.read_configuration() timestamps
+        config_ts_cache: ObjDict[Any] = field(default_factory=dict)
+
     def __init__(
         self,
         md: dict | None,
@@ -89,14 +110,10 @@ class RunBundler:
         self._bundle_name = None  # name given to event descriptor
         self._run_start_uid = None  # The (future) runstart uid
         self._objs_read: deque[HasName] = deque()  # objects read in one Event
-        self._read_cache: deque[dict[str, Reading]] = deque()  # cache of obj.read() in one Event
-        self._asset_docs_cache: deque[Asset | StreamAsset] = deque()  # cache of obj.collect_asset_docs()
-        self._describe_cache: ObjDict[DataKey] = dict()  # cache of all obj.describe() output  # noqa: C408
-        self._describe_collect_cache: dict[Any, dict[str, DataKey] | dict[str, dict[str, DataKey]]] = dict()  # noqa: C408  # cache of all obj.describe() output
 
-        self._config_desc_cache: ObjDict[DataKey] = dict()  # " obj.describe_configuration()  # noqa: C408
-        self._config_values_cache: ObjDict[Any] = dict()  # " obj.read_configuration() values  # noqa: C408
-        self._config_ts_cache: ObjDict[Any] = dict()  # " obj.read_configuration() timestamps  # noqa: C408
+        self._saved_stream_cache: dict[str, RunBundler._StreamCache] = dict()  # noqa: C408
+        self._current_stream_cache: RunBundler._StreamCache = RunBundler._StreamCache()
+
         # cache of {name: (doc, compose_event, compose_event_page)}
         self._descriptors: dict[Any, ComposeDescriptorBundle] = dict()  # noqa: C408
         self._descriptor_objs: dict[str, dict[HasName, dict[str, DataKey]]] = dict()  # noqa: C408
@@ -134,6 +151,9 @@ class RunBundler:
         self._compose_resource = run.compose_resource
         self._compose_stop = run.compose_stop
         self._compose_stream_resource = run.compose_stream_resource
+
+        self._current_stream_cache = RunBundler._StreamCache()
+        self._saved_stream_cache.clear()
 
         await self.emit(DocumentNames.start, doc)
         doc_logger.debug(
@@ -219,9 +239,9 @@ class RunBundler:
                 dks[key]["object_name"] = obj.name
             data_keys.update(dks)
             config[obj.name] = {
-                "data": self._config_values_cache[obj],
-                "timestamps": self._config_ts_cache[obj],
-                "data_keys": self._config_desc_cache[obj],
+                "data": self._current_stream_cache.config_values_cache[obj],
+                "timestamps": self._current_stream_cache.config_ts_cache[obj],
+                "data_keys": self._current_stream_cache.config_desc_cache[obj],
             }
 
         self._descriptors[desc_key] = self._compose_descriptor(
@@ -250,21 +270,14 @@ class RunBundler:
             list(objs_dks),
         )
 
-    def _needs_new_config_cache(self, obj) -> bool:
-        """Check if the bundle name is in the descriptors to check if we have done this before with this stream"""
-        # _bundle_name is stream name for read, is None on save. Don't need new cache on save.
-        if self._bundle_name is None:
-            return False
-        return self._bundle_name not in self._descriptor_objs
-
     async def _ensure_cached(self, obj, collect=False):
         coros = []
-        if not collect and obj not in self._describe_cache:
+        if not collect and obj not in self._current_stream_cache.describe_cache:
             coros.append(self._cache_describe(obj))
-        elif collect and obj not in self._describe_collect_cache:
+        elif collect and obj not in self._current_stream_cache.describe_collect_cache:
             coros.append(self._cache_describe_collect(obj))
 
-        if obj not in self._config_desc_cache or self._needs_new_config_cache(obj):
+        if obj not in self._current_stream_cache.config_desc_cache:
             coros.append(self._cache_describe_config(obj))
             coros.append(self._cache_read_config(obj))
         await asyncio.gather(*coros)
@@ -280,10 +293,16 @@ class RunBundler:
         objs = frozenset(objs)
         objs_dks = {}  # {collect_object: stream_data_keys}
 
+        if stream_name in self._saved_stream_cache:
+            self._current_stream_cache = self._saved_stream_cache[stream_name]
+        else:
+            self._current_stream_cache = RunBundler._StreamCache()
+            self._saved_stream_cache[stream_name] = self._current_stream_cache
+
         await asyncio.gather(*[self._ensure_cached(obj, collect=collect) for obj in objs])
         for obj in objs:
             if collect:
-                data_keys = self._describe_collect_cache[obj]
+                data_keys = self._current_stream_cache.describe_collect_cache[obj]
                 streams_and_data_keys = self._format_datakeys_with_stream_name(
                     data_keys, message_stream_name=stream_name
                 )
@@ -294,7 +313,7 @@ class RunBundler:
                     f"not return a single Dict[str, DataKey] for the passed in {stream_name}"
                 )
             else:
-                data_keys = self._describe_cache[obj]
+                data_keys = self._current_stream_cache.describe_cache[obj]
 
             objs_dks[obj] = data_keys
 
@@ -325,8 +344,10 @@ class RunBundler:
                 "bundle is closed with a 'save' or "
                 "'drop' message."
             )
-        self._read_cache.clear()
-        self._asset_docs_cache.clear()
+        self._current_stream_cache = RunBundler._StreamCache()
+        self._saved_stream_cache.clear()
+        # self._curr _read_cache.clear()
+        # self._asset_docs_cache.clear()
         self._objs_read.clear()
         self.bundling = True
         command, obj, args, kwargs, _ = msg
@@ -364,10 +385,10 @@ class RunBundler:
 
             # check that current read collides with nothing else in
             # current event
-            cur_keys = set(self._describe_cache[obj].keys())
+            cur_keys = set(self._current_stream_cache.describe_cache[obj].keys())
             for read_obj in self._objs_read:
                 # that is, field names
-                known_keys = self._describe_cache[read_obj].keys()
+                known_keys = self._current_stream_cache.describe_cache[read_obj].keys()
                 if set(known_keys) & cur_keys:
                     raise ValueError(
                         f"Data keys (field names) from {obj!r} "
@@ -380,19 +401,19 @@ class RunBundler:
 
             # Stash the results, which will be emitted the next time _save is
             # called --- or never emitted if _drop is called instead.
-            self._read_cache.append(reading)
+            self._current_stream_cache.read_cache.append(reading)
             # Ask the object for any resource or datum documents is has cached
             # and cache them as well. Likewise, these will be emitted if and
             # when _save is called.
             asset_docs_collected = [x async for x in maybe_collect_asset_docs(msg, obj, *msg.args, **msg.kwargs)]
-            self._asset_docs_cache.extend(asset_docs_collected)
+            self._current_stream_cache.asset_docs_cache.extend(asset_docs_collected)
 
         return reading
 
     async def _cache_describe(self, obj):
         "Read the object's describe and cache it."
         obj = check_supports(obj, Readable)
-        self._describe_cache[obj] = await maybe_await(obj.describe())
+        self._current_stream_cache.describe_cache[obj] = await maybe_await(obj.describe())
 
     async def _cache_describe_config(self, obj):
         "Read the object's describe_configuration and cache it."
@@ -402,7 +423,7 @@ class RunBundler:
         else:
             conf_keys = {}
 
-        self._config_desc_cache[obj] = conf_keys
+        self._current_stream_cache.config_desc_cache[obj] = conf_keys
 
     async def _cache_read_config(self, obj):
         "Read the object's configuration and cache it."
@@ -415,8 +436,8 @@ class RunBundler:
         for key, val in conf.items():
             config_values[key] = val["value"]
             config_ts[key] = val["timestamp"]
-        self._config_values_cache[obj] = config_values
-        self._config_ts_cache[obj] = config_ts
+        self._current_stream_cache.config_values_cache[obj] = config_values
+        self._current_stream_cache.config_ts_cache[obj] = config_ts
 
     async def monitor(self, msg):
         """
@@ -444,7 +465,7 @@ class RunBundler:
 
         await self._ensure_cached(obj)
 
-        stream_bundle = await self._prepare_stream(name, {obj: self._describe_cache[obj]})
+        stream_bundle = await self._prepare_stream(name, {obj: self._current_stream_cache.describe_cache[obj]})
         compose_event = stream_bundle[1]
 
         def emit_event(readings: dict[str, Reading] | None = None, *args, **kwargs):
@@ -570,7 +591,7 @@ class RunBundler:
             # use the dequeue not the set to preserve order
             for obj in self._objs_read:
                 await self._ensure_cached(obj, collect=isinstance(obj, Collectable))
-                objs_dks[obj] = self._describe_cache[obj]
+                objs_dks[obj] = self._current_stream_cache.describe_cache[obj]
 
             descriptor_doc, compose_event, d_objs = await self._prepare_stream(desc_key, objs_dks)
 
@@ -579,7 +600,9 @@ class RunBundler:
             raise RuntimeError(f"Mismatched objects read, expected {frozenset(d_objs)!s}, got {objs_read!s}")
 
         # Resource and Datum documents
-        indices_generated = await self._pack_external_assets(self._asset_docs_cache, message_stream_name=desc_key)
+        indices_generated = await self._pack_external_assets(
+            self._current_stream_cache.asset_docs_cache, message_stream_name=desc_key
+        )
         if indices_generated > 1:
             raise RuntimeError(
                 "Received multiple indices in a `stream_datum` document for one event, "
@@ -588,7 +611,7 @@ class RunBundler:
             )
 
         # Merge list of readings into single dict.
-        readings = {k: v for d in self._read_cache for k, v in d.items()}
+        readings = {k: v for d in self._current_stream_cache.read_cache for k, v in d.items()}
         data, timestamps = _rearrange_into_parallel_dicts(readings)
         # Mark all externally-stored data as not filled so that consumers
         # know that the corresponding data are identifiers, not dereferenced
@@ -727,7 +750,7 @@ class RunBundler:
         "Read the object's describe and cache it."
         obj = check_supports(obj, Collectable)
         c: dict[str, DataKey] | dict[str, dict[str, DataKey]] = await maybe_await(obj.describe_collect())
-        self._describe_collect_cache[obj] = c
+        self._current_stream_cache.describe_collect_cache[obj] = c
 
     async def _describe_collect(self, collect_object: Flyable):
         """Read an object's describe_collect and cache it.
@@ -754,7 +777,7 @@ class RunBundler:
         """
         await self._ensure_cached(collect_object, collect=True)
 
-        describe_collect = self._describe_collect_cache[collect_object]
+        describe_collect = self._current_stream_cache.describe_collect_cache[collect_object]
         describe_collect_items = self._format_datakeys_with_stream_name(describe_collect)
 
         local_descriptors: dict[frozenset[str], ComposeDescriptorBundle] = {}
