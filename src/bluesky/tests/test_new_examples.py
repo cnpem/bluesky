@@ -1030,7 +1030,6 @@ def test_device_has_new_read_configuration_once_per_stream(RE, hw):
 
 
 def test_cache_used_correct_number_of_times_for_object(RE, hw):
-    docs = DocHolder()
     device = MultiConfiguredDevice(hw.motor, "device")
     config_values = [0, 1, 2, 3]
     iterations = 2
@@ -1050,7 +1049,7 @@ def test_cache_used_correct_number_of_times_for_object(RE, hw):
     mock_describe = Mock(wraps=device.describe)
     device.describe = mock_describe
 
-    RE(multi_stream_plan(device, config_values, iterations), docs.append)
+    RE(multi_stream_plan(device, config_values, iterations))
 
     assert mock_read_config.call_count == expected_config_calls
     assert mock_describe_config.call_count == expected_config_describe_calls
