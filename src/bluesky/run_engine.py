@@ -769,14 +769,12 @@ class RunEngine:
 
         self._run_tracing_spans: list[Span] = []
 
-        # When cleared, RunEngine._run will pause until set.
-        self._run_permit = None
-
         setup_event = threading.Event()
+        self._single_run_executor = SingleRunExecutor()
 
         def setup_run_permit():
-            self._run_permit = asyncio.Event(**self._loop_for_kwargs)
-            self._run_permit.set()
+            self._single_run_executor.run_permit = asyncio.Event(**self._loop_for_kwargs)
+            self._single_run_executor.run_permit.set()
             setup_event.set()
 
         self.loop.call_soon_threadsafe(setup_run_permit)
@@ -1308,7 +1306,7 @@ class RunEngine:
 
         def _build_task():
             # make sure _run will block at the top
-            self._run_permit.clear()
+            self._single_run_executor.run_permit.clear()
             self._blocking_event.clear()
             self._task_fut = asyncio.run_coroutine_threadsafe(self._run(), loop=self.loop)
 
@@ -1407,7 +1405,7 @@ class RunEngine:
                 except concurrent.futures.CancelledError:
                     return self.NO_PLAN_RETURN
             # The _run task is waiting on this Event. Let is continue.
-            self.loop.call_soon_threadsafe(self._run_permit.set)
+            self.loop.call_soon_threadsafe(self._single_run_executor.run_permit.set)
             try:
                 # Block until plan is complete or exception is raised.
                 try:
