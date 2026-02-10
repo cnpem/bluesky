@@ -212,6 +212,345 @@ def _state_locked(func):
     return inner
 
 
+class SingleRunExecutor:
+
+    def __init__(self):
+        # When cleared, RunEngine._run will pause until set.
+        self._run_permit = None
+
+    async def _run(self):
+        """Pull messages from the plan, process them, send results back.
+
+        Upon exit, clean up.
+        - Call stop() on all objects that were 'set' or 'kickoff'.
+        - Try to collect any uncollected flyers.
+        - Try to unstage any devices left staged by the plan.
+        - Try to remove any monitoring subscriptions left on by the plan.
+        - If interrupting the middle of a run, try to emit a RunStop document.
+        """
+        await self.run_permit.wait()
+        # grab the current task.  We need to do this here because the
+        # object returned by `run_coroutine_threadsafe` is a future
+        # that acts as a proxy that does not have the correct behavior
+        # when `.cancel` is called on it.
+        with self._state_lock:
+            self._task = current_task(self.loop)
+        stashed_exception = None
+        debug = msg_logger.debug
+        self._reason = ""
+        # sentinel to decide if need to add to the response stack or not
+        sentinel = object()
+        plan_return = self.NO_PLAN_RETURN
+        exit_reason = ""
+        try:
+            self._state = "running"
+            while True:
+                if self._state in ("pausing", "suspending"):
+                    if not self.resumable:
+                        self.run_permit.set()
+                        stashed_exception = FailedPause()
+
+                        self._state = "aborting"
+                        continue
+                # currently only using 'suspending' to get us into the
+                # block above, we do not have a 'suspended' state
+                # (yet)
+                if self._state == "suspending":
+                    self._state = "running"
+                if not self.run_permit.is_set():
+                    # A pause has been requested. First, put everything in a
+                    # resting state.
+                    assert self._state == "pausing"
+                    # Remove any monitoring callbacks, but keep refs in
+                    # self._monitor_params to re-instate them later.
+                    for current_run in self._run_bundlers.values():
+                        await current_run.suspend_monitors()
+                    # During pause, all motors should be stopped. Call stop()
+                    # on every object we ever set().
+                    await self._stop_movable_objects(success=True)
+                    # Notify Devices of the pause in case they want to
+                    # clean up.
+                    for obj in self._objs_seen:
+                        if isinstance(obj, Pausable):
+                            try:
+                                await maybe_await(obj.pause())
+                            except NoReplayAllowed:
+                                self._reset_checkpoint_state_meth()
+                    self._state = "paused"
+                    # Let RunEngine.__call__ return...
+                    self._blocking_event.set()
+
+                    await self.run_permit.wait()
+                    # Restore any monitors
+                    for current_run in self._run_bundlers.values():
+                        await current_run.restore_monitors()
+                    if self._state == "paused":
+                        # may be called by 'resume', 'stop', 'abort', 'halt'
+                        self._state = "running"
+
+                    # If we are here, we have come back to life either to
+                    # continue (resume) or to clean up before exiting.
+
+                assert len(self._response_stack) == len(self._plan_stack)
+                # set resp to the sentinel so that if we fail in the sleep
+                # we do not add an extra response
+                resp = sentinel
+                try:
+                    # the new response to be added
+                    new_response = None
+
+                    # This 'await' must be here to ensure that this coroutine
+                    # breaks out of its current behavior before trying to get
+                    # the next message from the top of the generator stack in
+                    # case there has been a pause requested.  Without this the
+                    # next message after the pause may be processed first on
+                    # resume (instead of the first message in self._msg_cache).
+                    # This await also gives the co-routine for requesting
+                    # suspends a chance to run.
+
+                    # This sleep has to be inside of this try block so that any
+                    # of the 'async' exceptions get thrown in the correct
+                    # place.
+
+                    # If we are handling an exception, then burn through the
+                    # current plan stack before rather than allowing a pause or
+                    # suspension to try and finish firing.
+                    if stashed_exception is None:
+                        await asyncio.sleep(0, **self._loop_for_kwargs)
+                    # always pop off a result, we are either sending it back in
+                    # or throwing an exception in, in either case the left hand
+                    # side of the yield in the plan will be moved past
+                    resp = self._response_stack.pop()
+                    # if any status tasks have failed, grab the exceptions.
+                    # give priority to things pushed in from outside
+                    with self._state_lock:
+                        if self._exception is not None:
+                            stashed_exception = self._exception
+                            self._exception = None
+                    # The case where we have a stashed exception
+                    if stashed_exception is not None or isinstance(resp, Exception):
+                        # throw the exception at the current plan
+                        try:
+                            msg = self._plan_stack[-1].throw(stashed_exception or resp)
+                        except Exception as e:
+                            # The current plan did not handle it,
+                            # maybe the next plan (if any) would like
+                            # to try
+                            self._plan_stack.pop()
+                            # we have killed the current plan, do not give
+                            # it a new response
+                            resp = sentinel
+                            # If there is at least one plan left in the stack,
+                            # stash the new exception go back to top
+                            if len(self._plan_stack):
+                                stashed_exception = e
+                                continue
+                            # no plans left and still an unhandled exception
+                            # re-raise to exit the infinite loop
+                            else:
+                                raise
+                        # clear the stashed exception, the top plan
+                        # handled it.
+                        else:
+                            stashed_exception = None
+                    # The normal case of clean operation
+                    else:
+                        try:
+                            msg = self._plan_stack[-1].send(resp)
+                        # We have exhausted the top generator
+                        except StopIteration:
+                            # pop the dead generator go back to the top
+                            self._plan_stack.pop()
+                            # we have killed the current plan, do not give
+                            # it a new response
+                            resp = sentinel
+                            if len(self._plan_stack):
+                                continue
+                            # or reraise to get out of the infinite loop
+                            else:
+                                raise
+                        # Any other exception that comes out of the plan
+                        except Exception as e:
+                            # pop the dead plan, stash the exception and
+                            # go to the top of the loop
+                            self._plan_stack.pop()
+                            # we have killed the current plan, do not give
+                            # it a new response
+                            resp = sentinel
+                            if len(self._plan_stack):
+                                stashed_exception = e
+                                continue
+                            # or reraise to get out of the infinite loop
+                            else:
+                                raise
+
+                    # if we have a message hook, call it
+                    if self.msg_hook is not None:
+                        self.msg_hook(msg)
+                    debug(
+                        "%s(%r, *%r **%r, run=%r)",
+                        msg.command,
+                        msg.obj,
+                        msg.args,
+                        msg.kwargs,
+                        msg.run,
+                        extra={"msg_command": msg.command},
+                    )
+
+                    # update the running set of all objects we have seen
+                    self._objs_seen.add(msg.obj)
+
+                    # if this message can be cached for rewinding, cache it
+                    if (
+                        self._msg_cache is not None
+                        and self._rewindable_flag
+                        and msg.command not in self._UNCACHEABLE_COMMANDS
+                    ):
+                        # We have a checkpoint.
+                        self._msg_cache.append(msg)
+
+                    # try to look up the coroutine to execute the command
+                    if (
+                        coro := self._command_registry.get(msg.command, key_absence_sentinel := object())
+                    ) is key_absence_sentinel:
+                        # flag invalid command
+                        # and return to the top of the loop
+                        new_response = InvalidCommand(msg.command)
+                        continue
+
+                    # try to finally run the command the user asked for
+                    try:
+                        # this is one of two places that 'async'
+                        # exceptions (coming in via throw) can be
+                        # raised
+                        new_response = await coro(msg)
+
+                    # special case `CancelledError` and let the outer
+                    # exception block deal with it.
+                    except asyncio.CancelledError:
+                        raise
+                    # any other exception, stash it and go to the top of loop
+                    except Exception as e:
+                        new_response = e
+                        continue
+                    # normal use, if it runs cleanly, stash the response and
+                    # go to the top of the loop
+                    else:
+                        continue
+
+                except KeyboardInterrupt:
+                    # This only happens if some external code captures SIGINT
+                    # -- overriding the RunEngine -- and then raises instead
+                    # of (properly) calling the RunEngine's handler.
+                    # See https://github.com/NSLS-II/bluesky/pull/242
+                    print(
+                        "An unknown external library has improperly raised "
+                        "KeyboardInterrupt. Intercepting and triggering "
+                        "a HALT."
+                    )
+                    await self._halt_coro()
+                except asyncio.CancelledError as e:
+                    if self._state == "pausing":
+                        # if we got a CancelledError and we are in the
+                        # 'pausing' state clear the run permit and
+                        # bounce to the top
+                        self.run_permit.clear()
+                        continue
+                    if self._state in ("halting", "stopping", "aborting"):
+                        # if we got this while just keep going in tear-down
+                        exception_map = {"halting": PlanHalt, "stopping": RequestStop, "aborting": RequestAbort}
+                        # if the exception is not set bounce to the top
+                        if stashed_exception is None:
+                            stashed_exception = exception_map[self.state]
+                        continue
+                    if self._state == "suspending":
+                        # just bounce to the top
+                        continue
+                    # if we are handling this twice, raise and leave the plans
+                    # alone
+                    if stashed_exception is e:
+                        raise e
+                    # the case where FailedPause, RequestAbort or a coro
+                    # raised error is not already stashed in _exception
+                    if stashed_exception is None:
+                        stashed_exception = e
+                finally:
+                    # if we poped a response and did not pop a plan, we need
+                    # to put the new response back on the stack
+                    if resp is not sentinel:
+                        self._response_stack.append(new_response)
+
+        except StopIteration as e:
+            self._exit_status = "success"
+            plan_return = e.value
+            # TODO Is the sleep here necessary?
+            await asyncio.sleep(0, **self._loop_for_kwargs)
+        except RequestStop:
+            self._exit_status = "success"
+            # TODO Is the sleep here necessary?
+            await asyncio.sleep(0, **self._loop_for_kwargs)
+        except (FailedPause, RequestAbort, asyncio.CancelledError, PlanHalt):
+            self._exit_status = "abort"
+            # TODO Is the sleep here necessary?
+            await asyncio.sleep(0, **self._loop_for_kwargs)
+            self.log.exception("Run aborted")
+        except GeneratorExit as err:
+            self._exit_status = "fail"  # Exception raises during 'running'
+            exit_reason = str(err)
+            raise ValueError from err
+        except Exception as err:
+            self._exit_status = "fail"  # Exception raises during 'running'
+            exit_reason = str(err)
+            self.log.exception("Run aborted")
+            raise err
+        finally:
+            if not exit_reason:
+                exit_reason = self._reason
+            # Some done_callbacks may still be alive in other threads.
+            # Block them from creating new 'failed status' tasks on the loop.
+            self._pardon_failures.set()
+            # call stop() on every movable object we ever set()
+            await self._stop_movable_objects(success=True)
+            for current_run in self._run_bundlers.values():
+                # Clear any uncleared monitoring callbacks.
+                current_run.clear_monitors()
+                # Try to collect any flyers that were kicked off but
+                # not finished.  Some might not support partial
+                # collection. We swallow errors.
+                await current_run.backstop_collect()
+            # in case we were interrupted between 'stage' and 'unstage'
+            for obj in list(self._staged):
+                try:
+                    obj.unstage()
+                except Exception:
+                    self.log.exception("Failed to unstage %r.", obj)
+                self._staged.remove(obj)
+
+            sys.stdout.flush()
+            # Emit RunStop if necessary.
+            for key, current_run in self._run_bundlers.items():
+                if current_run.run_is_open:
+                    try:
+                        await current_run.close_run(
+                            Msg("close_run", exit_status=self._exit_status, reason=exit_reason, run_id=key)
+                        )
+                    except Exception:
+                        self.log.error("Failed to close run %r.", current_run)
+            self._run_bundlers.clear()
+
+            for p in self._plan_stack:
+                try:
+                    p.close()
+                except RuntimeError:
+                    print(f"The plan {p!r} tried to yield a value on close.  Please fix your plan.")
+
+            self._state = "idle"
+
+        self.log.info("Cleaned up from plan %r", self._plan)
+        if isinstance(stashed_exception, asyncio.CancelledError):
+            raise stashed_exception
+        return plan_return
+
 class RunEngine:
     """The Run Engine execute messages and emits Documents.
 
@@ -1474,338 +1813,6 @@ class RunEngine:
             _span.set_attribute("exit_status", "aborted")
             _span.end()
 
-    async def _run(self):
-        """Pull messages from the plan, process them, send results back.
-
-        Upon exit, clean up.
-        - Call stop() on all objects that were 'set' or 'kickoff'.
-        - Try to collect any uncollected flyers.
-        - Try to unstage any devices left staged by the plan.
-        - Try to remove any monitoring subscriptions left on by the plan.
-        - If interrupting the middle of a run, try to emit a RunStop document.
-        """
-        await self._run_permit.wait()
-        # grab the current task.  We need to do this here because the
-        # object returned by `run_coroutine_threadsafe` is a future
-        # that acts as a proxy that does not have the correct behavior
-        # when `.cancel` is called on it.
-        with self._state_lock:
-            self._task = current_task(self.loop)
-        stashed_exception = None
-        debug = msg_logger.debug
-        self._reason = ""
-        # sentinel to decide if need to add to the response stack or not
-        sentinel = object()
-        plan_return = self.NO_PLAN_RETURN
-        exit_reason = ""
-        try:
-            self._state = "running"
-            while True:
-                if self._state in ("pausing", "suspending"):
-                    if not self.resumable:
-                        self._run_permit.set()
-                        stashed_exception = FailedPause()
-
-                        self._state = "aborting"
-                        continue
-                # currently only using 'suspending' to get us into the
-                # block above, we do not have a 'suspended' state
-                # (yet)
-                if self._state == "suspending":
-                    self._state = "running"
-                if not self._run_permit.is_set():
-                    # A pause has been requested. First, put everything in a
-                    # resting state.
-                    assert self._state == "pausing"
-                    # Remove any monitoring callbacks, but keep refs in
-                    # self._monitor_params to re-instate them later.
-                    for current_run in self._run_bundlers.values():
-                        await current_run.suspend_monitors()
-                    # During pause, all motors should be stopped. Call stop()
-                    # on every object we ever set().
-                    await self._stop_movable_objects(success=True)
-                    # Notify Devices of the pause in case they want to
-                    # clean up.
-                    for obj in self._objs_seen:
-                        if isinstance(obj, Pausable):
-                            try:
-                                await maybe_await(obj.pause())
-                            except NoReplayAllowed:
-                                self._reset_checkpoint_state_meth()
-                    self._state = "paused"
-                    # Let RunEngine.__call__ return...
-                    self._blocking_event.set()
-
-                    await self._run_permit.wait()
-                    # Restore any monitors
-                    for current_run in self._run_bundlers.values():
-                        await current_run.restore_monitors()
-                    if self._state == "paused":
-                        # may be called by 'resume', 'stop', 'abort', 'halt'
-                        self._state = "running"
-
-                    # If we are here, we have come back to life either to
-                    # continue (resume) or to clean up before exiting.
-
-                assert len(self._response_stack) == len(self._plan_stack)
-                # set resp to the sentinel so that if we fail in the sleep
-                # we do not add an extra response
-                resp = sentinel
-                try:
-                    # the new response to be added
-                    new_response = None
-
-                    # This 'await' must be here to ensure that this coroutine
-                    # breaks out of its current behavior before trying to get
-                    # the next message from the top of the generator stack in
-                    # case there has been a pause requested.  Without this the
-                    # next message after the pause may be processed first on
-                    # resume (instead of the first message in self._msg_cache).
-                    # This await also gives the co-routine for requesting
-                    # suspends a chance to run.
-
-                    # This sleep has to be inside of this try block so that any
-                    # of the 'async' exceptions get thrown in the correct
-                    # place.
-
-                    # If we are handling an exception, then burn through the
-                    # current plan stack before rather than allowing a pause or
-                    # suspension to try and finish firing.
-                    if stashed_exception is None:
-                        await asyncio.sleep(0, **self._loop_for_kwargs)
-                    # always pop off a result, we are either sending it back in
-                    # or throwing an exception in, in either case the left hand
-                    # side of the yield in the plan will be moved past
-                    resp = self._response_stack.pop()
-                    # if any status tasks have failed, grab the exceptions.
-                    # give priority to things pushed in from outside
-                    with self._state_lock:
-                        if self._exception is not None:
-                            stashed_exception = self._exception
-                            self._exception = None
-                    # The case where we have a stashed exception
-                    if stashed_exception is not None or isinstance(resp, Exception):
-                        # throw the exception at the current plan
-                        try:
-                            msg = self._plan_stack[-1].throw(stashed_exception or resp)
-                        except Exception as e:
-                            # The current plan did not handle it,
-                            # maybe the next plan (if any) would like
-                            # to try
-                            self._plan_stack.pop()
-                            # we have killed the current plan, do not give
-                            # it a new response
-                            resp = sentinel
-                            # If there is at least one plan left in the stack,
-                            # stash the new exception go back to top
-                            if len(self._plan_stack):
-                                stashed_exception = e
-                                continue
-                            # no plans left and still an unhandled exception
-                            # re-raise to exit the infinite loop
-                            else:
-                                raise
-                        # clear the stashed exception, the top plan
-                        # handled it.
-                        else:
-                            stashed_exception = None
-                    # The normal case of clean operation
-                    else:
-                        try:
-                            msg = self._plan_stack[-1].send(resp)
-                        # We have exhausted the top generator
-                        except StopIteration:
-                            # pop the dead generator go back to the top
-                            self._plan_stack.pop()
-                            # we have killed the current plan, do not give
-                            # it a new response
-                            resp = sentinel
-                            if len(self._plan_stack):
-                                continue
-                            # or reraise to get out of the infinite loop
-                            else:
-                                raise
-                        # Any other exception that comes out of the plan
-                        except Exception as e:
-                            # pop the dead plan, stash the exception and
-                            # go to the top of the loop
-                            self._plan_stack.pop()
-                            # we have killed the current plan, do not give
-                            # it a new response
-                            resp = sentinel
-                            if len(self._plan_stack):
-                                stashed_exception = e
-                                continue
-                            # or reraise to get out of the infinite loop
-                            else:
-                                raise
-
-                    # if we have a message hook, call it
-                    if self.msg_hook is not None:
-                        self.msg_hook(msg)
-                    debug(
-                        "%s(%r, *%r **%r, run=%r)",
-                        msg.command,
-                        msg.obj,
-                        msg.args,
-                        msg.kwargs,
-                        msg.run,
-                        extra={"msg_command": msg.command},
-                    )
-
-                    # update the running set of all objects we have seen
-                    self._objs_seen.add(msg.obj)
-
-                    # if this message can be cached for rewinding, cache it
-                    if (
-                        self._msg_cache is not None
-                        and self._rewindable_flag
-                        and msg.command not in self._UNCACHEABLE_COMMANDS
-                    ):
-                        # We have a checkpoint.
-                        self._msg_cache.append(msg)
-
-                    # try to look up the coroutine to execute the command
-                    if (
-                        coro := self._command_registry.get(msg.command, key_absence_sentinel := object())
-                    ) is key_absence_sentinel:
-                        # flag invalid command
-                        # and return to the top of the loop
-                        new_response = InvalidCommand(msg.command)
-                        continue
-
-                    # try to finally run the command the user asked for
-                    try:
-                        # this is one of two places that 'async'
-                        # exceptions (coming in via throw) can be
-                        # raised
-                        new_response = await coro(msg)
-
-                    # special case `CancelledError` and let the outer
-                    # exception block deal with it.
-                    except asyncio.CancelledError:
-                        raise
-                    # any other exception, stash it and go to the top of loop
-                    except Exception as e:
-                        new_response = e
-                        continue
-                    # normal use, if it runs cleanly, stash the response and
-                    # go to the top of the loop
-                    else:
-                        continue
-
-                except KeyboardInterrupt:
-                    # This only happens if some external code captures SIGINT
-                    # -- overriding the RunEngine -- and then raises instead
-                    # of (properly) calling the RunEngine's handler.
-                    # See https://github.com/NSLS-II/bluesky/pull/242
-                    print(
-                        "An unknown external library has improperly raised "
-                        "KeyboardInterrupt. Intercepting and triggering "
-                        "a HALT."
-                    )
-                    await self._halt_coro()
-                except asyncio.CancelledError as e:
-                    if self._state == "pausing":
-                        # if we got a CancelledError and we are in the
-                        # 'pausing' state clear the run permit and
-                        # bounce to the top
-                        self._run_permit.clear()
-                        continue
-                    if self._state in ("halting", "stopping", "aborting"):
-                        # if we got this while just keep going in tear-down
-                        exception_map = {"halting": PlanHalt, "stopping": RequestStop, "aborting": RequestAbort}
-                        # if the exception is not set bounce to the top
-                        if stashed_exception is None:
-                            stashed_exception = exception_map[self.state]
-                        continue
-                    if self._state == "suspending":
-                        # just bounce to the top
-                        continue
-                    # if we are handling this twice, raise and leave the plans
-                    # alone
-                    if stashed_exception is e:
-                        raise e
-                    # the case where FailedPause, RequestAbort or a coro
-                    # raised error is not already stashed in _exception
-                    if stashed_exception is None:
-                        stashed_exception = e
-                finally:
-                    # if we poped a response and did not pop a plan, we need
-                    # to put the new response back on the stack
-                    if resp is not sentinel:
-                        self._response_stack.append(new_response)
-
-        except StopIteration as e:
-            self._exit_status = "success"
-            plan_return = e.value
-            # TODO Is the sleep here necessary?
-            await asyncio.sleep(0, **self._loop_for_kwargs)
-        except RequestStop:
-            self._exit_status = "success"
-            # TODO Is the sleep here necessary?
-            await asyncio.sleep(0, **self._loop_for_kwargs)
-        except (FailedPause, RequestAbort, asyncio.CancelledError, PlanHalt):
-            self._exit_status = "abort"
-            # TODO Is the sleep here necessary?
-            await asyncio.sleep(0, **self._loop_for_kwargs)
-            self.log.exception("Run aborted")
-        except GeneratorExit as err:
-            self._exit_status = "fail"  # Exception raises during 'running'
-            exit_reason = str(err)
-            raise ValueError from err
-        except Exception as err:
-            self._exit_status = "fail"  # Exception raises during 'running'
-            exit_reason = str(err)
-            self.log.exception("Run aborted")
-            raise err
-        finally:
-            if not exit_reason:
-                exit_reason = self._reason
-            # Some done_callbacks may still be alive in other threads.
-            # Block them from creating new 'failed status' tasks on the loop.
-            self._pardon_failures.set()
-            # call stop() on every movable object we ever set()
-            await self._stop_movable_objects(success=True)
-            for current_run in self._run_bundlers.values():
-                # Clear any uncleared monitoring callbacks.
-                current_run.clear_monitors()
-                # Try to collect any flyers that were kicked off but
-                # not finished.  Some might not support partial
-                # collection. We swallow errors.
-                await current_run.backstop_collect()
-            # in case we were interrupted between 'stage' and 'unstage'
-            for obj in list(self._staged):
-                try:
-                    obj.unstage()
-                except Exception:
-                    self.log.exception("Failed to unstage %r.", obj)
-                self._staged.remove(obj)
-
-            sys.stdout.flush()
-            # Emit RunStop if necessary.
-            for key, current_run in self._run_bundlers.items():
-                if current_run.run_is_open:
-                    try:
-                        await current_run.close_run(
-                            Msg("close_run", exit_status=self._exit_status, reason=exit_reason, run_id=key)
-                        )
-                    except Exception:
-                        self.log.error("Failed to close run %r.", current_run)
-            self._run_bundlers.clear()
-
-            for p in self._plan_stack:
-                try:
-                    p.close()
-                except RuntimeError:
-                    print(f"The plan {p!r} tried to yield a value on close.  Please fix your plan.")
-
-            self._state = "idle"
-
-        self.log.info("Cleaned up from plan %r", self._plan)
-        if isinstance(stashed_exception, asyncio.CancelledError):
-            raise stashed_exception
-        return plan_return
 
     async def _wait_for(self, msg):
         """Instruct the RunEngine to wait for futures and return the resulting tasks.
