@@ -224,6 +224,14 @@ class SingleRunExecutor:
     def state(self, value):
         self._state = value
 
+    @property
+    def verbose(self):
+        return not self.log.disabled
+
+    @verbose.setter
+    def verbose(self, value):
+        self.log.disabled = not value
+
     def __init__(
             self,
             loop: asyncio.AbstractEventLoop | None = None,
@@ -245,6 +253,10 @@ class SingleRunExecutor:
         # When cleared, RunEngine._run will pause until set.
         self._run_permit = None
         self.state_lock = threading.RLock()
+
+        # Make a logger for this specific RE instance, using the instance's
+        # Python id, to keep from mixing output from separate instances.
+        self.log = ComposableLogAdapter(logger, {"RE": self})
 
     async def _run(self):
         """Pull messages from the plan, process them, send results back.
@@ -761,6 +773,10 @@ class RunEngine:
     RunBundler = RunBundler
 
     @property
+    def log(self):
+        return self._single_run_executor.log
+    
+    @property
     def state(self):
         return self._single_run_executor.state
     
@@ -812,10 +828,6 @@ class RunEngine:
 
         self.loop.call_soon_threadsafe(setup_run_permit)
         setup_event.wait()
-
-        # Make a logger for this specific RE instance, using the instance's
-        # Python id, to keep from mixing output from separate instances.
-        self.log = ComposableLogAdapter(logger, {"RE": self})
 
         if md is None:
             md = {}
@@ -1075,11 +1087,11 @@ class RunEngine:
 
     @property
     def verbose(self):
-        return not self.log.disabled
+        return self._single_run_executor.verbose
 
     @verbose.setter
     def verbose(self, value):
-        self.log.disabled = not value
+        self._single_run_executor.verbose = value
 
     @property
     def call_returns_result(self):
