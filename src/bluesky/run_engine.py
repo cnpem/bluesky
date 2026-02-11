@@ -183,7 +183,7 @@ class LoggingPropertyMachine(PropertyMachine):
     def __set__(self, obj, value):
         own = type(obj)
         old_value = self.__get__(obj, own)
-        with obj._state_lock:
+        with obj.state_lock:
             super().__set__(obj, value)
         value = self.__get__(obj, own)
         tags = {"old_state": old_value, "new_state": value, "RE": self}
@@ -195,7 +195,7 @@ class LoggingPropertyMachine(PropertyMachine):
     def __get__(self, instance, owner):
         if instance is None:
             return super().__get__(instance, owner)
-        with instance._state_lock:
+        with instance.state_lock:
             return super().__get__(instance, owner)
 
 
@@ -206,7 +206,7 @@ def default_scan_id_source(md):
 def _state_locked(func):
     @functools.wraps(func)
     def inner(self, *args, **kwargs):
-        with self._state_lock:
+        with self._single_run_executor.state_lock:
             return func(self, *args, **kwargs)
 
     return inner
@@ -227,6 +227,7 @@ class SingleRunExecutor:
     def __init__(self):
         # When cleared, RunEngine._run will pause until set.
         self._run_permit = None
+        self.state_lock = threading.RLock()
 
     async def _run(self):
         """Pull messages from the plan, process them, send results back.
@@ -243,7 +244,7 @@ class SingleRunExecutor:
         # object returned by `run_coroutine_threadsafe` is a future
         # that acts as a proxy that does not have the correct behavior
         # when `.cancel` is called on it.
-        with self._state_lock:
+        with self.state_lock:
             self._task = current_task(self.loop)
         stashed_exception = None
         debug = msg_logger.debug
@@ -333,7 +334,7 @@ class SingleRunExecutor:
                     resp = self._response_stack.pop()
                     # if any status tasks have failed, grab the exceptions.
                     # give priority to things pushed in from outside
-                    with self._state_lock:
+                    with self.state_lock:
                         if self._exception is not None:
                             stashed_exception = self._exception
                             self._exception = None
@@ -764,7 +765,6 @@ class RunEngine:
             loop = asyncio.new_event_loop()
         set_bluesky_event_loop(loop)
         self._th = _ensure_event_loop_running(loop)
-        self._state_lock = threading.RLock()
         self._loop = loop
         if sys.version_info < (3, 8):  # noqa: UP036
             self._loop_for_kwargs = {"loop": self._loop}
@@ -1314,7 +1314,7 @@ class RunEngine:
             # make sure _run will block at the top
             self._single_run_executor.run_permit.clear()
             self._blocking_event.clear()
-            self._task_fut = asyncio.run_coroutine_threadsafe(self._run(), loop=self.loop)
+            self._task_fut = asyncio.run_coroutine_threadsafe(self._single_run_executor._run(), loop=self.loop)
 
             def set_blocking_event(future):
                 self._blocking_event.set()
@@ -1570,7 +1570,7 @@ class RunEngine:
                 print("No checkpoint; cannot suspend.")
                 print("Aborting: running cleanup and marking exit_status as 'abort'...")
                 self._interrupted = True
-                with self._state_lock:
+                with self._single_run_executor.state_lock:
                     self._exception = FailedPause()
                 was_paused = self._single_run_executor.state == "paused"
                 self._single_run_executor.state = "aborting"
@@ -1683,7 +1683,7 @@ class RunEngine:
         was_paused = self._single_run_executor.state == "paused"
         self._single_run_executor.state = "aborting"
         if was_paused:
-            with self._state_lock:
+            with self._single_run_executor.state_lock:
                 self._exception = RequestAbort()
         else:
             self._task.cancel()
@@ -1723,7 +1723,7 @@ class RunEngine:
         was_paused = self._single_run_executor.state == "paused"
         self._single_run_executor.state = "stopping"
         if was_paused:
-            with self._state_lock:
+            with self._single_run_executor.state_lock:
                 self._exception = RequestStop
         else:
             self._task.cancel()
@@ -1787,7 +1787,7 @@ class RunEngine:
         was_paused = self._single_run_executor.state == "paused"
         self._single_run_executor.state = "halting"
         if was_paused:
-            with self._state_lock:
+            with self._single_run_executor.state_lock:
                 self._exception = PlanHalt
                 self._exit_status = "abort"
         else:
@@ -2388,7 +2388,7 @@ class RunEngine:
         if not ret.success and not pardon_failures.is_set():
             # TODO: need a better channel to move this information back
             # to the run task.
-            with self._state_lock:
+            with self._single_run_executor.state_lock:
                 try:
                     exc = ret.exception(timeout=0)
                     raise FailedStatus(ret) from exc
