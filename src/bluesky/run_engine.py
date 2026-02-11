@@ -472,7 +472,7 @@ class SingleRunExecutor:
                         exception_map = {"halting": PlanHalt, "stopping": RequestStop, "aborting": RequestAbort}
                         # if the exception is not set bounce to the top
                         if stashed_exception is None:
-                            stashed_exception = exception_map[self._single_run_executor.state]
+                            stashed_exception = exception_map[self._state]
                         continue
                     if self._state == "suspending":
                         # just bounce to the top
@@ -732,6 +732,10 @@ class RunEngine:
 
     RunBundler = RunBundler
 
+    @property
+    def state(self):
+        return self._single_run_executor.state
+    
     @property
     def deferred_pause_requested(self):
         """
@@ -1099,7 +1103,7 @@ class RunEngine:
 
         Lossless subscriptions are not unsubscribed.
         """
-        if self._single_run_executor.state != "idle":
+        if self.state != "idle":
             self.halt()
         self._clear_run_cache()
         self._clear_call_cache()
@@ -1170,7 +1174,7 @@ class RunEngine:
             If True, pause at the next checkpoint.
             False by default.
         """
-        if self._single_run_executor.state == "panicked":
+        if self.state == "panicked":
             raise RuntimeError("The RunEngine is panicked and cannot be recovered. You must restart bluesky.")
         future = asyncio.run_coroutine_threadsafe(self._request_pause_coro(defer), loop=self.loop)
         # TODO add a timeout here?
@@ -1178,8 +1182,8 @@ class RunEngine:
 
     async def _request_pause_coro(self, defer=False):
         # We are pausing. Cancel any deferred pause previously requested.
-        if not self._single_run_executor.state.can_pause:
-            raise TransitionError(f"Run Engine is in '{self._single_run_executor.state}' state and can not be paused.")
+        if not self.state.can_pause:
+            raise TransitionError(f"Run Engine is in '{self.state}' state and can not be paused.")
 
         if defer:
             self._deferred_pause_requested = True
@@ -1190,7 +1194,7 @@ class RunEngine:
 
         self._deferred_pause_requested = False
         self._interrupted = True
-        self._single_run_executor.state = "pausing"
+        self.state = "pausing"
         for current_run in self._run_bundlers.values():
             current_run.record_interruption("pause")
 
@@ -1248,7 +1252,7 @@ class RunEngine:
         result : :class:`RunEngineResult`
             if :attr:`RunEngine._call_returns_result` is ``True``
         """
-        if self._single_run_executor.state == "panicked":
+        if self.state == "panicked":
             raise RuntimeError("The RunEngine is panicked and cannot be recovered. You must restart bluesky.")
         if "raise_if_interrupted" in metadata_kw:
             warn(  # noqa: B028
@@ -1267,8 +1271,8 @@ class RunEngine:
                 raise RuntimeError(text)
 
         # If we are in the wrong state, raise.
-        if not self._single_run_executor.state.is_idle:
-            raise RuntimeError(f"The RunEngine is in a {self._single_run_executor.state} state")
+        if not self.state.is_idle:
+            raise RuntimeError(f"The RunEngine is in a {self.state} state")
 
         futs = []
         tripped_justifications = []
@@ -1343,13 +1347,13 @@ class RunEngine:
         result : :class:`RunEngineResult`
             if :attr:`RunEngine._call_returns_result` is ``True``
         """
-        if self._single_run_executor.state == "panicked":
+        if self.state == "panicked":
             raise RuntimeError("The RunEngine is panicked and cannot be recovered. You must restart bluesky.")
 
         # The state machine does not capture the whole picture.
-        if not self._single_run_executor.state.is_paused:
+        if not self.state.is_paused:
             raise TransitionError(
-                f"The RunEngine is the {self._single_run_executor.state} state. You can only resume for the paused state."
+                f"The RunEngine is the {self.state} state. You can only resume for the paused state."
             )
 
         self._interrupted = False
@@ -1440,7 +1444,7 @@ class RunEngine:
                     # before giving up and putting the RE in a
                     # non-recoverable panicked state.
                     if not task_finished or num_threads != 1:
-                        self._single_run_executor.state = "panicked"
+                        self.state = "panicked"
                 except Exception as raised_er:
                     self.halt()
                     self._interrupted = True
@@ -1572,8 +1576,8 @@ class RunEngine:
                 self._interrupted = True
                 with self._single_run_executor.state_lock:
                     self._exception = FailedPause()
-                was_paused = self._single_run_executor.state == "paused"
-                self._single_run_executor.state = "aborting"
+                was_paused = self.state == "paused"
+                self.state = "aborting"
                 if not was_paused:
                     self._task.cancel()
             if justification is not None:
@@ -1588,8 +1592,8 @@ class RunEngine:
             # The event loop is still running. The pre_plan will be processed,
             # and then the RunEngine will be hung up on processing the
             # 'wait_for' message until `fut` is set.
-            if not self._single_run_executor.state == "paused":
-                self._single_run_executor.state = "suspending"
+            if not self.state == "paused":
+                self.state = "suspending"
                 # bump the _run task out of what ever it is awaiting
                 self._task.cancel()
 
@@ -1671,7 +1675,7 @@ class RunEngine:
         return self.__interrupter_helper(self._abort_coro(reason))
 
     async def _abort_coro(self, reason):
-        if self._single_run_executor.state.is_idle:
+        if self.state.is_idle:
             raise TransitionError("RunEngine is already idle.")
         print("Aborting: running cleanup and marking exit_status as 'abort'...")
         self._interrupted = True
@@ -1680,8 +1684,8 @@ class RunEngine:
         self._exit_status = "abort"
         self._destroy_open_run_tracing_spans()
 
-        was_paused = self._single_run_executor.state == "paused"
-        self._single_run_executor.state = "aborting"
+        was_paused = self.state == "paused"
+        self.state = "aborting"
         if was_paused:
             with self._single_run_executor.state_lock:
                 self._exception = RequestAbort()
@@ -1715,13 +1719,13 @@ class RunEngine:
         return self.__interrupter_helper(self._stop_coro())
 
     async def _stop_coro(self):
-        if self._single_run_executor.state.is_idle:
+        if self.state.is_idle:
             raise TransitionError("RunEngine is already idle.")
         print("Stopping: running cleanup and marking exit_status as 'success'...")
 
         self._interrupted = True
-        was_paused = self._single_run_executor.state == "paused"
-        self._single_run_executor.state = "stopping"
+        was_paused = self.state == "paused"
+        self.state = "stopping"
         if was_paused:
             with self._single_run_executor.state_lock:
                 self._exception = RequestStop
@@ -1755,7 +1759,7 @@ class RunEngine:
         return self.__interrupter_helper(self._halt_coro())
 
     def __interrupter_helper(self, coro):
-        if self._single_run_executor.state == "panicked":
+        if self.state == "panicked":
             coro.close()
             raise RuntimeError("The RunEngine is panicked and cannot be recovered. You must restart bluesky.")
 
@@ -1770,7 +1774,7 @@ class RunEngine:
             task = self.loop.create_task(coro)
             task.add_done_callback(end_cb)
 
-        was_paused = self._single_run_executor.state == "paused"
+        was_paused = self.state == "paused"
         self.loop.call_soon_threadsafe(start_task)
         coro_event.wait()
         if was_paused:
@@ -1779,13 +1783,13 @@ class RunEngine:
         return task.result()
 
     async def _halt_coro(self):
-        if self._single_run_executor.state.is_idle:
+        if self.state.is_idle:
             raise TransitionError("RunEngine is already idle.")
         print("Halting: skipping cleanup and marking exit_status as 'abort'...")
         self._destroy_open_run_tracing_spans()
         self._interrupted = True
-        was_paused = self._single_run_executor.state == "paused"
-        self._single_run_executor.state = "halting"
+        was_paused = self.state == "paused"
+        self.state = "halting"
         if was_paused:
             with self._single_run_executor.state_lock:
                 self._exception = PlanHalt
