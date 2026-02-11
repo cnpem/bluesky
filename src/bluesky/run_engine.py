@@ -260,6 +260,7 @@ class SingleRunExecutor:
         self.objs_seen: set[typing.Any] = set()  # all objects seen
         self.plan_stack: deque[typing.Any] = deque()  # stack of generators to work off of
         self.response_stack: deque[typing.Any] = deque()  # resps to send into the plans
+        self.msg_cache: deque[typing.Any] = deque()  # history of processed msgs for rewinding
 
         self.state_lock = threading.RLock()
 
@@ -353,7 +354,7 @@ class SingleRunExecutor:
                     # the next message from the top of the generator stack in
                     # case there has been a pause requested.  Without this the
                     # next message after the pause may be processed first on
-                    # resume (instead of the first message in self._msg_cache).
+                    # resume (instead of the first message in self.msg_cache).
                     # This await also gives the co-routine for requesting
                     # suspends a chance to run.
 
@@ -451,12 +452,12 @@ class SingleRunExecutor:
 
                     # if this message can be cached for rewinding, cache it
                     if (
-                        self._msg_cache is not None
+                        self.msg_cache is not None
                         and self._rewindable_flag
                         and msg.command not in self._UNCACHEABLE_COMMANDS
                     ):
                         # We have a checkpoint.
-                        self._msg_cache.append(msg)
+                        self.msg_cache.append(msg)
 
                     # try to look up the coroutine to execute the command
                     if (
@@ -900,7 +901,6 @@ class RunEngine:
         self._seen_wait_and_move_on_keys: set[typing.Any] = (
             set()
         )  # group ids that have been passed to _wait_and_move_on
-        self._msg_cache: deque[typing.Any] = deque()  # history of processed msgs for rewinding
         self._rewindable_flag: bool = True  # if the RE is allowed to replay msgs
         self._exit_status = "success"  # optimistic default
         self._reason = ""  # reason for abort
@@ -1118,7 +1118,7 @@ class RunEngine:
         self._single_run_executor.movable_objs_touched.clear()
         self._deferred_pause_requested = False
         self._single_run_executor.plan_stack = deque()
-        self._msg_cache = deque()
+        self._single_run_executor.msg_cache = deque()
         self._single_run_executor.response_stack = deque()
         self._single_run_executor.exception = None
         self._run_start_uids.clear()
@@ -1150,7 +1150,7 @@ class RunEngine:
     @property
     def resumable(self):
         "i.e., can the plan in progress by rewound"
-        return self._msg_cache is not None
+        return self._single_run_executor.msg_cache is not None
 
     @property
     def ignore_callback_exceptions(self):
@@ -1424,9 +1424,9 @@ class RunEngine:
              A new plan made from the messages in the message cache
 
         """
-        len_msg_cache = len(self._msg_cache)
-        new_plan = ensure_generator(list(self._msg_cache))
-        self._msg_cache = deque()
+        len_msg_cache = len(self._single_run_executor.msg_cache)
+        new_plan = ensure_generator(list(self._single_run_executor.msg_cache))
+        self._single_run_executor.msg_cache = deque()
         if len_msg_cache:
             for current_run in self._single_run_executor.run_bundlers.values():
                 current_run.rewind()
@@ -2500,10 +2500,10 @@ class RunEngine:
         self._reset_checkpoint_state_meth()
 
     def _reset_checkpoint_state_meth(self):
-        if self._msg_cache is None:
+        if self._single_run_executor.msg_cache is None:
             return
 
-        self._msg_cache = deque()
+        self._single_run_executor.msg_cache = deque()
         for current_run in self._single_run_executor.run_bundlers.values():
             current_run.reset_checkpoint_state()
 
@@ -2518,7 +2518,7 @@ class RunEngine:
             Msg('clear_checkpoint')
         """
         # clear message cache
-        self._msg_cache = None
+        self._single_run_executor.msg_cache = None
         # clear stashed
         for current_run in self._single_run_executor.run_bundlers.values():
             await current_run.clear_checkpoint(msg)
