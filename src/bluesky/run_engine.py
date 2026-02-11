@@ -224,7 +224,16 @@ class SingleRunExecutor:
     def state(self, value):
         self._state = value
 
-    def __init__(self):
+    def __init__(
+            self,
+            loop: asyncio.AbstractEventLoop | None = None,
+        ):
+        if loop is None:
+            loop = asyncio.new_event_loop()
+        set_bluesky_event_loop(loop)
+        self.th = _ensure_event_loop_running(loop)
+        self.loop = loop
+
         # When cleared, RunEngine._run will pause until set.
         self._run_permit = None
         self.state_lock = threading.RLock()
@@ -765,13 +774,9 @@ class RunEngine:
         during_task: DuringTask | None = None,
         call_returns_result: bool = False,
     ):
-        if loop is None:
-            loop = asyncio.new_event_loop()
-        set_bluesky_event_loop(loop)
-        self._th = _ensure_event_loop_running(loop)
-        self._loop = loop
+        self._single_run_executor = SingleRunExecutor(loop)
         if sys.version_info < (3, 8):  # noqa: UP036
-            self._loop_for_kwargs = {"loop": self._loop}
+            self._loop_for_kwargs = {"loop": self.loop}
         else:
             self._loop_for_kwargs: dict[str, asyncio.AbstractEventLoop] = {}
         # When set, RunEngine.__call__ should stop blocking.
@@ -780,7 +785,6 @@ class RunEngine:
         self._run_tracing_spans: list[Span] = []
 
         setup_event = threading.Event()
-        self._single_run_executor = SingleRunExecutor()
 
         def setup_run_permit():
             self._single_run_executor.run_permit = asyncio.Event(**self._loop_for_kwargs)
@@ -1046,7 +1050,7 @@ class RunEngine:
 
     @property
     def loop(self):
-        return self._loop
+        return self._single_run_executor.loop
 
     @property
     def suspenders(self):
@@ -1365,7 +1369,7 @@ class RunEngine:
         # Notify Devices of the resume in case they want to clean up.
         for obj in self._objs_seen:
             if isinstance(obj, Pausable):
-                fut = asyncio.run_coroutine_threadsafe(maybe_await(obj.resume()), self._loop)
+                fut = asyncio.run_coroutine_threadsafe(maybe_await(obj.resume()), self.loop)
                 fut.result()
         plan_return = self._resume_task()
         if self._interrupted:
@@ -1434,7 +1438,7 @@ class RunEngine:
                     #
                     # Here we cheat a bit and use ctypes.
                     num_threads = ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                        ctypes.c_ulong(self._th.ident), ctypes.py_object(_RunEnginePanic)
+                        ctypes.c_ulong(self._single_run_executor.th.ident), ctypes.py_object(_RunEnginePanic)
                     )
                     # however, if the thread is in a system call (such
                     # as sleep or I/O) there is no way to interrupt it
@@ -2537,12 +2541,12 @@ class RunEngine:
         return old, new
 
     def _add_status_to_group(self, obj: typing.Any, status_object: Status, group: str, action: str) -> None:
-        fut = self._loop.create_future()
+        fut = self.loop.create_future()
         pardon_failures = self._pardon_failures
 
         def done_callback(status: Status):
             self.log.debug("The object %r reports %r is done with status %r.", obj, action, status_object.success)
-            self._loop.call_soon_threadsafe(self._status_object_completed, status_object, fut, pardon_failures)
+            self.loop.call_soon_threadsafe(self._status_object_completed, status_object, fut, pardon_failures)
 
         try:
             status_object.add_callback(done_callback)
