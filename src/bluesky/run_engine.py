@@ -249,6 +249,7 @@ class SingleRunExecutor:
         self.run_bundlers: dict[typing.Any, RunBundler] = {}  # a mapping of open run -> bundlers
         self.movable_objs_touched: set[typing.Any] = set()  # objects we moved at any point
         self.plan_stack: deque[typing.Any] = deque()  # stack of generators to work off of
+        self.response_stack: deque[typing.Any] = deque()  # resps to send into the plans
 
         # When cleared, RunEngine._run will pause until set.
         self._run_permit = None
@@ -331,7 +332,7 @@ class SingleRunExecutor:
                     # If we are here, we have come back to life either to
                     # continue (resume) or to clean up before exiting.
 
-                assert len(self._response_stack) == len(self.plan_stack)
+                assert len(self.response_stack) == len(self.plan_stack)
                 # set resp to the sentinel so that if we fail in the sleep
                 # we do not add an extra response
                 resp = sentinel
@@ -360,7 +361,7 @@ class SingleRunExecutor:
                     # always pop off a result, we are either sending it back in
                     # or throwing an exception in, in either case the left hand
                     # side of the yield in the plan will be moved past
-                    resp = self._response_stack.pop()
+                    resp = self.response_stack.pop()
                     # if any status tasks have failed, grab the exceptions.
                     # give priority to things pushed in from outside
                     with self.state_lock:
@@ -518,7 +519,7 @@ class SingleRunExecutor:
                     # if we poped a response and did not pop a plan, we need
                     # to put the new response back on the stack
                     if resp is not sentinel:
-                        self._response_stack.append(new_response)
+                        self.response_stack.append(new_response)
 
         except StopIteration as e:
             self._exit_status = "success"
@@ -900,7 +901,6 @@ class RunEngine:
         )  # group ids that have been passed to _wait_and_move_on
         self._msg_cache: deque[typing.Any] = deque()  # history of processed msgs for rewinding
         self._rewindable_flag: bool = True  # if the RE is allowed to replay msgs
-        self._response_stack: deque[typing.Any] = deque()  # resps to send into the plans
         self._exit_status = "success"  # optimistic default
         self._reason = ""  # reason for abort
         self._task = None  # asyncio.Task associated with call to self._run
@@ -1114,7 +1114,7 @@ class RunEngine:
         self._deferred_pause_requested = False
         self._single_run_executor.plan_stack = deque()
         self._msg_cache = deque()
-        self._response_stack = deque()
+        self._single_run_executor.response_stack = deque()
         self._exception = None
         self._run_start_uids.clear()
         self._exit_status = "success"
@@ -1341,10 +1341,10 @@ class RunEngine:
             gen = wrapper_func(gen)
 
         self._single_run_executor.plan_stack.append(gen)
-        self._response_stack.append(None)
+        self._single_run_executor.response_stack.append(None)
         if futs:
             self._single_run_executor.plan_stack.append(single_gen(Msg("wait_for", None, futs)))
-            self._response_stack.append(None)
+            self._single_run_executor.response_stack.append(None)
         self.log.info("Executing plan %r", self._plan)
 
         def _build_task():
@@ -1394,7 +1394,7 @@ class RunEngine:
             current_run.record_interruption("resume")
         new_plan = self._rewind()
         self._single_run_executor.plan_stack.append(new_plan)
-        self._response_stack.append(None)
+        self._single_run_executor.response_stack.append(None)
         # Notify Devices of the resume in case they want to clean up.
         for obj in self._objs_seen:
             if isinstance(obj, Pausable):
@@ -1620,7 +1620,7 @@ class RunEngine:
             self._single_run_executor.plan_stack.append(
                 single_gen(Msg("_start_suspender", None, pre_plan, post_plan, justification, fut))
             )
-            self._response_stack.append(None)
+            self._single_run_executor.response_stack.append(None)
 
             # The event loop is still running. The pre_plan will be processed,
             # and then the RunEngine will be hung up on processing the
@@ -1686,7 +1686,7 @@ class RunEngine:
 
         # add the above helper to the plan stack
         self._single_run_executor.plan_stack.append(suspender_helper_inner_plan())
-        self._response_stack.append(None)
+        self._single_run_executor.response_stack.append(None)
 
     def abort(self, reason=""):
         """
