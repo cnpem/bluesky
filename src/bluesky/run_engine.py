@@ -214,6 +214,21 @@ def _state_locked(func):
 
 class SingleRunExecutor:
 
+    _UNCACHEABLE_COMMANDS = [
+        "pause",
+        "subscribe",
+        "unsubscribe",
+        "stage",
+        "unstage",
+        "monitor",
+        "unmonitor",
+        "open_run",
+        "close_run",
+        "install_suspender",
+        "remove_suspender",
+        "_start_suspender",
+    ]
+
     _state = LoggingPropertyMachine(RunEngineStateMachine)
 
     @property
@@ -776,21 +791,6 @@ class RunEngine:
         The list of commands available to Msg.
 
     """
-
-    _UNCACHEABLE_COMMANDS = [
-        "pause",
-        "subscribe",
-        "unsubscribe",
-        "stage",
-        "unstage",
-        "monitor",
-        "unmonitor",
-        "open_run",
-        "close_run",
-        "install_suspender",
-        "remove_suspender",
-        "_start_suspender",
-    ]
 
     RunBundler = RunBundler
 
