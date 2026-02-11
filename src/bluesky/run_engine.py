@@ -294,6 +294,45 @@ class SingleRunExecutor:
         # Make a logger for this specific RE instance, using the instance's
         # Python id, to keep from mixing output from separate instances.
         self.log = ComposableLogAdapter(logger, {"RE": self})
+        
+        self.command_registry = {
+            "declare_stream": self._declare_stream,
+            "create": self._create,
+            "save": self._save,
+            "drop": self._drop,
+            "read": self._read,
+            "locate": self._locate,
+            "monitor": self._monitor,
+            "unmonitor": self._unmonitor,
+            "null": self._null,
+            "RE_class": self._RE_class,
+            "stop": self._stop,
+            "set": self._set,
+            "trigger": self._trigger,
+            "sleep": self._sleep,
+            "wait": self._wait,
+            "checkpoint": self._checkpoint,
+            "clear_checkpoint": self._clear_checkpoint,
+            "rewindable": self._rewindable,
+            "pause": self._pause,
+            "_resume_from_suspender": self._resume,
+            "_start_suspender": self._start_suspender,
+            "prepare": self._prepare,
+            "collect": self._collect,
+            "kickoff": self._kickoff,
+            "complete": self._complete,
+            "configure": self._configure,
+            "stage": self._stage,
+            "unstage": self._unstage,
+            "subscribe": self._subscribe,
+            "unsubscribe": self._unsubscribe,
+            "open_run": self._open_run,
+            "close_run": self._close_run,
+            "wait_for": self._wait_for,
+            "input": self._input,
+            "install_suspender": self._install_suspender,
+            "remove_suspender": self._remove_suspender,
+        }
 
     async def _run(self):
         """Pull messages from the plan, process them, send results back.
@@ -488,7 +527,7 @@ class SingleRunExecutor:
 
                     # try to look up the coroutine to execute the command
                     if (
-                        coro := self._command_registry.get(msg.command, key_absence_sentinel := object())
+                        coro := self.command_registry.get(msg.command, key_absence_sentinel := object())
                     ) is key_absence_sentinel:
                         # flag invalid command
                         # and return to the top of the loop
@@ -919,44 +958,6 @@ class RunEngine:
         self._task_fut = None  # future proxy to the task above
         self._plan = None  # the plan instance from __call__
         self._require_stream_declaration = False
-        self._command_registry = {
-            "declare_stream": self._declare_stream,
-            "create": self._create,
-            "save": self._save,
-            "drop": self._drop,
-            "read": self._read,
-            "locate": self._locate,
-            "monitor": self._monitor,
-            "unmonitor": self._unmonitor,
-            "null": self._null,
-            "RE_class": self._RE_class,
-            "stop": self._stop,
-            "set": self._set,
-            "trigger": self._trigger,
-            "sleep": self._sleep,
-            "wait": self._wait,
-            "checkpoint": self._checkpoint,
-            "clear_checkpoint": self._clear_checkpoint,
-            "rewindable": self._rewindable,
-            "pause": self._pause,
-            "_resume_from_suspender": self._resume,
-            "_start_suspender": self._start_suspender,
-            "prepare": self._prepare,
-            "collect": self._collect,
-            "kickoff": self._kickoff,
-            "complete": self._complete,
-            "configure": self._configure,
-            "stage": self._stage,
-            "unstage": self._unstage,
-            "subscribe": self._subscribe,
-            "unsubscribe": self._unsubscribe,
-            "open_run": self._open_run,
-            "close_run": self._close_run,
-            "wait_for": self._wait_for,
-            "input": self._input,
-            "install_suspender": self._install_suspender,
-            "remove_suspender": self._remove_suspender,
-        }
 
         # public dispatcher for callbacks
         # The Dispatcher's public methods are exposed through the
@@ -997,7 +998,7 @@ class RunEngine:
         >>> RE.commands
         """
         # return as a list, not lazy loader, no surprises...
-        return list(self._command_registry.keys())
+        return list(self._single_run_executor.command_registry.keys())
 
     def print_command_registry(self, verbose=False):
         """
@@ -1024,7 +1025,7 @@ class RunEngine:
         """
         commands = "List of available commands\n"
 
-        for command, func in self._command_registry.items():
+        for command, func in self._single_run_executor.command_registry.items():
             docstring = func.__doc__
             if not verbose:
                 docstring = docstring.split("\n")[0]
@@ -1184,7 +1185,7 @@ class RunEngine:
         :meth:`RunEngine.print_command_registry`
         :attr:`RunEngine.commands`
         """
-        self._command_registry[name] = func
+        self._single_run_executor.command_registry[name] = func
 
     def unregister_command(self, name):
         """
@@ -1200,7 +1201,7 @@ class RunEngine:
         :meth:`RunEngine.print_command_registry`
         :attr:`RunEngine.commands`
         """
-        del self._command_registry[name]
+        del self._single_run_executor.command_registry[name]
 
     def request_pause(self, defer=False):
         """
