@@ -232,6 +232,17 @@ class SingleRunExecutor:
     def verbose(self, value):
         self.log.disabled = not value
 
+    @property
+    def rewindable(self):
+        return self._rewindable_flag
+
+    @rewindable.setter
+    def rewindable(self, v):
+        cur_state = self._rewindable_flag
+        self._rewindable_flag = bool(v)
+        if self.resumable and self._rewindable_flag != cur_state:
+            self._reset_checkpoint_state()
+
     def __init__(
             self,
             loop: asyncio.AbstractEventLoop | None = None,
@@ -253,7 +264,8 @@ class SingleRunExecutor:
         self.state_hook = None
         self.pardon_failures = None  # will hold an asyncio.Event
         self.exception = None  # stored and then raised in the _run loop
-        
+        self._rewindable_flag: bool = True  # if the RE is allowed to replay msgs
+
         self.staged: set[typing.Any] = set()  # objects staged, not yet unstaged
         self.run_bundlers: dict[typing.Any, RunBundler] = {}  # a mapping of open run -> bundlers
         self.movable_objs_touched: set[typing.Any] = set()  # objects we moved at any point
@@ -901,7 +913,6 @@ class RunEngine:
         self._seen_wait_and_move_on_keys: set[typing.Any] = (
             set()
         )  # group ids that have been passed to _wait_and_move_on
-        self._rewindable_flag: bool = True  # if the RE is allowed to replay msgs
         self._exit_status = "success"  # optimistic default
         self._reason = ""  # reason for abort
         self._task = None  # asyncio.Task associated with call to self._run
@@ -1073,14 +1084,11 @@ class RunEngine:
 
     @property
     def rewindable(self):
-        return self._rewindable_flag
+        return self._single_run_executor.rewindable
 
     @rewindable.setter
     def rewindable(self, v):
-        cur_state = self._rewindable_flag
-        self._rewindable_flag = bool(v)
-        if self.resumable and self._rewindable_flag != cur_state:
-            self._reset_checkpoint_state()
+        self._single_run_executor.rewindable = v
 
     @property
     def loop(self):
