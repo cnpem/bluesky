@@ -233,6 +233,7 @@ class SingleRunExecutor:
         set_bluesky_event_loop(loop)
         self.th = _ensure_event_loop_running(loop)
         self.loop = loop
+        self.pardon_failures = None  # will hold an asyncio.Event
 
         # When cleared, RunEngine._run will pause until set.
         self._run_permit = None
@@ -260,7 +261,7 @@ class SingleRunExecutor:
         self._reason = ""
         # sentinel to decide if need to add to the response stack or not
         sentinel = object()
-        plan_return = self.NO_PLAN_RETURN
+        plan_return = object()
         exit_reason = ""
         try:
             self._state = "running"
@@ -528,7 +529,7 @@ class SingleRunExecutor:
                 exit_reason = self._reason
             # Some done_callbacks may still be alive in other threads.
             # Block them from creating new 'failed status' tasks on the loop.
-            self._pardon_failures.set()
+            self.pardon_failures.set()
             # call stop() on every movable object we ever set()
             await self._stop_movable_objects(success=True)
             for current_run in self._run_bundlers.values():
@@ -879,7 +880,6 @@ class RunEngine:
         self._reason = ""  # reason for abort
         self._task = None  # asyncio.Task associated with call to self._run
         self._task_fut = None  # future proxy to the task above
-        self._pardon_failures = None  # will hold an asyncio.Event
         self._plan = None  # the plan instance from __call__
         self._require_stream_declaration = False
         self._command_registry = {
@@ -1092,7 +1092,7 @@ class RunEngine:
         self._reason = ""
         self._task = None
         self._task_fut = None
-        self._pardon_failures = asyncio.Event(**self._loop_for_kwargs)
+        self._single_run_executor.pardon_failures = asyncio.Event(**self._loop_for_kwargs)
         self._plan = None
         self._interrupted = False
 
@@ -2542,7 +2542,7 @@ class RunEngine:
 
     def _add_status_to_group(self, obj: typing.Any, status_object: Status, group: str, action: str) -> None:
         fut = self.loop.create_future()
-        pardon_failures = self._pardon_failures
+        pardon_failures = self._sinle_run_executor.pardon_failures
 
         def done_callback(status: Status):
             self.log.debug("The object %r reports %r is done with status %r.", obj, action, status_object.success)
