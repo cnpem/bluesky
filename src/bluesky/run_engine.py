@@ -242,6 +242,11 @@ class SingleRunExecutor:
         self.th = _ensure_event_loop_running(loop)
         self.loop = loop
 
+        if sys.version_info < (3, 8):  # noqa: UP036
+            self.loop_for_kwargs = {"loop": self.loop}
+        else:
+            self.loop_for_kwargs: dict[str, asyncio.AbstractEventLoop] = {}
+
         self.state_hook = None
         self.pardon_failures = None  # will hold an asyncio.Event
         
@@ -357,7 +362,7 @@ class SingleRunExecutor:
                     # current plan stack before rather than allowing a pause or
                     # suspension to try and finish firing.
                     if stashed_exception is None:
-                        await asyncio.sleep(0, **self._loop_for_kwargs)
+                        await asyncio.sleep(0, **self.loop_for_kwargs)
                     # always pop off a result, we are either sending it back in
                     # or throwing an exception in, in either case the left hand
                     # side of the yield in the plan will be moved past
@@ -525,15 +530,15 @@ class SingleRunExecutor:
             self._exit_status = "success"
             plan_return = e.value
             # TODO Is the sleep here necessary?
-            await asyncio.sleep(0, **self._loop_for_kwargs)
+            await asyncio.sleep(0, **self.loop_for_kwargs)
         except RequestStop:
             self._exit_status = "success"
             # TODO Is the sleep here necessary?
-            await asyncio.sleep(0, **self._loop_for_kwargs)
+            await asyncio.sleep(0, **self.loop_for_kwargs)
         except (FailedPause, RequestAbort, asyncio.CancelledError, PlanHalt):
             self._exit_status = "abort"
             # TODO Is the sleep here necessary?
-            await asyncio.sleep(0, **self._loop_for_kwargs)
+            await asyncio.sleep(0, **self.loop_for_kwargs)
             self.log.exception("Run aborted")
         except GeneratorExit as err:
             self._exit_status = "fail"  # Exception raises during 'running'
@@ -811,10 +816,6 @@ class RunEngine:
         call_returns_result: bool = False,
     ):
         self._single_run_executor = SingleRunExecutor(loop)
-        if sys.version_info < (3, 8):  # noqa: UP036
-            self._loop_for_kwargs = {"loop": self.loop}
-        else:
-            self._loop_for_kwargs: dict[str, asyncio.AbstractEventLoop] = {}
         # When set, RunEngine.__call__ should stop blocking.
         self._blocking_event = threading.Event()
 
@@ -823,7 +824,7 @@ class RunEngine:
         setup_event = threading.Event()
 
         def setup_run_permit():
-            self._single_run_executor.run_permit = asyncio.Event(**self._loop_for_kwargs)
+            self._single_run_executor.run_permit = asyncio.Event(**self._single_run_executor.loop_for_kwargs)
             self._single_run_executor.run_permit.set()
             setup_event.set()
 
@@ -1121,7 +1122,7 @@ class RunEngine:
         self._reason = ""
         self._task = None
         self._task_fut = None
-        self._single_run_executor.pardon_failures = asyncio.Event(**self._loop_for_kwargs)
+        self._single_run_executor.pardon_failures = asyncio.Event(**self._single_run_executor.loop_for_kwargs)
         self._plan = None
         self._interrupted = False
 
@@ -1862,7 +1863,7 @@ class RunEngine:
 
         (futs,) = msg.args
         futs = [asyncio.ensure_future(f()) for f in futs]
-        completed, pending = await asyncio.wait(futs, **self._loop_for_kwargs, **msg.kwargs)
+        completed, pending = await asyncio.wait(futs, **self._single_run_executor.loop_for_kwargs, **msg.kwargs)
         if pending:
             raise WaitForTimeoutError("Plan failed to complete in the specified time")
         return futs
@@ -2438,7 +2439,7 @@ class RunEngine:
 
         where `sleep_time` is in seconds
         """
-        await asyncio.sleep(*msg.args, **self._loop_for_kwargs)
+        await asyncio.sleep(*msg.args, **self._single_run_executor.loop_for_kwargs)
 
     async def _pause(self, msg):
         """Request the run engine to pause
@@ -2488,7 +2489,7 @@ class RunEngine:
             # We are at a checkpoint; we are done deferring the pause.
             # Give the _check_for_signals coroutine time to look for
             # additional SIGINTs that would trigger an abort.
-            await asyncio.sleep(0.5, **self._loop_for_kwargs)
+            await asyncio.sleep(0.5, **self._single_run_executor.loop_for_kwargs)
             await self._request_pause_coro(defer=False)
 
     def _reset_checkpoint_state(self):
