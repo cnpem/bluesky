@@ -240,7 +240,7 @@ class SingleRunExecutor:
         self.staged: set[typing.Any] = set()  # objects staged, not yet unstaged
         self.run_bundlers: dict[typing.Any, RunBundler] = {}  # a mapping of open run -> bundlers
         self.movable_objs_touched: set[typing.Any] = set()  # objects we moved at any point
-        self.pardon_failures = None  # will hold an asyncio.Event
+        self.plan_stack: deque[typing.Any] = deque()  # stack of generators to work off of
 
         # When cleared, RunEngine._run will pause until set.
         self._run_permit = None
@@ -319,7 +319,7 @@ class SingleRunExecutor:
                     # If we are here, we have come back to life either to
                     # continue (resume) or to clean up before exiting.
 
-                assert len(self._response_stack) == len(self._plan_stack)
+                assert len(self._response_stack) == len(self.plan_stack)
                 # set resp to the sentinel so that if we fail in the sleep
                 # we do not add an extra response
                 resp = sentinel
@@ -359,18 +359,18 @@ class SingleRunExecutor:
                     if stashed_exception is not None or isinstance(resp, Exception):
                         # throw the exception at the current plan
                         try:
-                            msg = self._plan_stack[-1].throw(stashed_exception or resp)
+                            msg = self.plan_stack[-1].throw(stashed_exception or resp)
                         except Exception as e:
                             # The current plan did not handle it,
                             # maybe the next plan (if any) would like
                             # to try
-                            self._plan_stack.pop()
+                            self.plan_stack.pop()
                             # we have killed the current plan, do not give
                             # it a new response
                             resp = sentinel
                             # If there is at least one plan left in the stack,
                             # stash the new exception go back to top
-                            if len(self._plan_stack):
+                            if len(self.plan_stack):
                                 stashed_exception = e
                                 continue
                             # no plans left and still an unhandled exception
@@ -384,15 +384,15 @@ class SingleRunExecutor:
                     # The normal case of clean operation
                     else:
                         try:
-                            msg = self._plan_stack[-1].send(resp)
+                            msg = self.plan_stack[-1].send(resp)
                         # We have exhausted the top generator
                         except StopIteration:
                             # pop the dead generator go back to the top
-                            self._plan_stack.pop()
+                            self.plan_stack.pop()
                             # we have killed the current plan, do not give
                             # it a new response
                             resp = sentinel
-                            if len(self._plan_stack):
+                            if len(self.plan_stack):
                                 continue
                             # or reraise to get out of the infinite loop
                             else:
@@ -401,11 +401,11 @@ class SingleRunExecutor:
                         except Exception as e:
                             # pop the dead plan, stash the exception and
                             # go to the top of the loop
-                            self._plan_stack.pop()
+                            self.plan_stack.pop()
                             # we have killed the current plan, do not give
                             # it a new response
                             resp = sentinel
-                            if len(self._plan_stack):
+                            if len(self.plan_stack):
                                 stashed_exception = e
                                 continue
                             # or reraise to get out of the infinite loop
@@ -566,7 +566,7 @@ class SingleRunExecutor:
                         self.log.error("Failed to close run %r.", current_run)
             self.run_bundlers.clear()
 
-            for p in self._plan_stack:
+            for p in self.plan_stack:
                 try:
                     p.close()
                 except RuntimeError:
@@ -888,7 +888,6 @@ class RunEngine:
         )  # group ids that have been passed to _wait_and_move_on
         self._msg_cache: deque[typing.Any] = deque()  # history of processed msgs for rewinding
         self._rewindable_flag: bool = True  # if the RE is allowed to replay msgs
-        self._plan_stack: deque[typing.Any] = deque()  # stack of generators to work off of
         self._response_stack: deque[typing.Any] = deque()  # resps to send into the plans
         self._exit_status = "success"  # optimistic default
         self._reason = ""  # reason for abort
@@ -1101,7 +1100,7 @@ class RunEngine:
         self._objs_seen.clear()
         self._single_run_executor.movable_objs_touched.clear()
         self._deferred_pause_requested = False
-        self._plan_stack = deque()
+        self._single_run_executor.plan_stack = deque()
         self._msg_cache = deque()
         self._response_stack = deque()
         self._exception = None
@@ -1329,10 +1328,10 @@ class RunEngine:
         for wrapper_func in self.preprocessors:
             gen = wrapper_func(gen)
 
-        self._plan_stack.append(gen)
+        self._single_run_executor.plan_stack.append(gen)
         self._response_stack.append(None)
         if futs:
-            self._plan_stack.append(single_gen(Msg("wait_for", None, futs)))
+            self._single_run_executor.plan_stack.append(single_gen(Msg("wait_for", None, futs)))
             self._response_stack.append(None)
         self.log.info("Executing plan %r", self._plan)
 
@@ -1382,7 +1381,7 @@ class RunEngine:
         for current_run in self._single_run_executor.run_bundlers.values():
             current_run.record_interruption("resume")
         new_plan = self._rewind()
-        self._plan_stack.append(new_plan)
+        self._single_run_executor.plan_stack.append(new_plan)
         self._response_stack.append(None)
         # Notify Devices of the resume in case they want to clean up.
         for obj in self._objs_seen:
@@ -1606,7 +1605,7 @@ class RunEngine:
                 print(f"Justification for this suspension:\n{justification}")
 
             # add starting the suspender logic to the stack
-            self._plan_stack.append(
+            self._single_run_executor.plan_stack.append(
                 single_gen(Msg("_start_suspender", None, pre_plan, post_plan, justification, fut))
             )
             self._response_stack.append(None)
@@ -1674,7 +1673,7 @@ class RunEngine:
             yield from rewind_plan
 
         # add the above helper to the plan stack
-        self._plan_stack.append(suspender_helper_inner_plan())
+        self._single_run_executor.plan_stack.append(suspender_helper_inner_plan())
         self._response_stack.append(None)
 
     def abort(self, reason=""):
