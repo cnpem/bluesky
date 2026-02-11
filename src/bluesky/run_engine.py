@@ -234,6 +234,7 @@ class SingleRunExecutor:
         self.th = _ensure_event_loop_running(loop)
         self.loop = loop
 
+        self.state_hook = None
         self.pardon_failures = None  # will hold an asyncio.Event
         
         self.staged: set[typing.Any] = set()  # objects staged, not yet unstaged
@@ -856,7 +857,6 @@ class RunEngine:
 
         self.max_depth = None
         self.msg_hook = None
-        self.state_hook = None
         self.waiting_hook = None
         self.record_interruptions = False
         self.pause_msg = PAUSE_MSG
@@ -946,6 +946,10 @@ class RunEngine:
         self.unsubscribe_lossless = self.dispatcher.unsubscribe
         self._subscribe_lossless = self.dispatcher.subscribe
         self._unsubscribe_lossless = self.dispatcher.unsubscribe
+
+    @property
+    def state_hook(self):
+        return self._single_run_executor.state_hook
 
     @property
     def commands(self):
