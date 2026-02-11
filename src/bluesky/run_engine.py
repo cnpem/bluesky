@@ -249,6 +249,7 @@ class SingleRunExecutor:
 
         # When cleared, RunEngine._run will pause until set.
         self.run_permit = None
+        self.msg_hook = None
         self.state_hook = None
         self.pardon_failures = None  # will hold an asyncio.Event
         self.exception = None  # stored and then raised in the _run loop
@@ -871,7 +872,6 @@ class RunEngine:
         self.scan_id_source = scan_id_source
 
         self.max_depth = None
-        self.msg_hook = None
         self.waiting_hook = None
         self.record_interruptions = False
         self.pause_msg = PAUSE_MSG
@@ -959,6 +959,10 @@ class RunEngine:
         self._subscribe_lossless = self.dispatcher.subscribe
         self._unsubscribe_lossless = self.dispatcher.unsubscribe
 
+    @property
+    def msg_hook(self):
+        return self._single_run_executor.msg_hook
+    
     @property
     def state_hook(self):
         return self._single_run_executor.state_hook
