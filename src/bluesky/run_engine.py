@@ -269,6 +269,7 @@ class SingleRunExecutor:
         self.pardon_failures = None  # will hold an asyncio.Event
         self.exception = None  # stored and then raised in the _run loop
         self._rewindable_flag: bool = True  # if the RE is allowed to replay msgs
+        self.plan = None  # the plan instance from __call__
 
         self.staged: set[typing.Any] = set()  # objects staged, not yet unstaged
         self.run_bundlers: dict[typing.Any, RunBundler] = {}  # a mapping of open run -> bundlers
@@ -680,7 +681,7 @@ class SingleRunExecutor:
 
             self._state = "idle"
 
-        self.log.info("Cleaned up from plan %r", self._plan)
+        self.log.info("Cleaned up from plan %r", self.plan)
         if isinstance(stashed_exception, asyncio.CancelledError):
             raise stashed_exception
         return plan_return
@@ -733,15 +734,15 @@ class SingleRunExecutor:
         self._md["scan_id"] = await maybe_await(self.scan_id_source(self._md))
 
         # For metadata below, info about plan passed to self.__call__ for.
-        plan_type = type(self._plan).__name__
-        plan_name = getattr(self._plan, "__name__", "")
+        plan_type = type(self.plan).__name__
+        plan_name = getattr(self.plan, "__name__", "")
 
         # Combine metadata, in order of decreasing precedence:
         md = ChainMap(
             self._metadata_per_call,  # from kwargs to self.__call__
             msg.kwargs,  # from 'open_run' Msg
             {
-                "plan_type": plan_type,  # computed from self._plan
+                "plan_type": plan_type,  # computed from self.plan
                 "plan_name": plan_name,
             },
             self._md,
@@ -1942,7 +1943,6 @@ class RunEngine:
         self._reason = ""  # reason for abort
         self._task = None  # asyncio.Task associated with call to self._run
         self._task_fut = None  # future proxy to the task above
-        self._plan = None  # the plan instance from __call__
         self._require_stream_declaration = False
 
         # public dispatcher for callbacks
@@ -2134,7 +2134,7 @@ class RunEngine:
         self._task = None
         self._task_fut = None
         self._single_run_executor.pardon_failures = asyncio.Event(**self._single_run_executor.loop_for_kwargs)
-        self._plan = None
+        self._single_run_executor.plan = None
         self._interrupted = False
 
         # Unsubscribe for per-run callbacks.
@@ -2345,7 +2345,7 @@ class RunEngine:
             for func in funcs:
                 self._temp_callback_ids.add(self.subscribe(func, name))
 
-        self._plan = plan  # this ref is just used for metadata introspection
+        self._single_run_executor.plan = plan  # this ref is just used for metadata introspection
         self._metadata_per_call.update(metadata_kw)
 
         gen = ensure_generator(plan)
@@ -2357,7 +2357,7 @@ class RunEngine:
         if futs:
             self._single_run_executor.plan_stack.append(single_gen(Msg("wait_for", None, futs)))
             self._single_run_executor.response_stack.append(None)
-        self.log.info("Executing plan %r", self._plan)
+        self.log.info("Executing plan %r", self._single_run_executor.plan)
 
         def _build_task():
             # make sure _run will block at the top
