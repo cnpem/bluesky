@@ -239,27 +239,9 @@ class SingleRunExecutor:
     def state(self, value):
         self._state = value
 
-    @property
-    def verbose(self):
-        return not self.log.disabled
-
-    @verbose.setter
-    def verbose(self, value):
-        self.log.disabled = not value
-
-    @property
-    def rewindable(self):
-        return self._rewindable_flag
-
-    @rewindable.setter
-    def rewindable(self, v):
-        cur_state = self._rewindable_flag
-        self._rewindable_flag = bool(v)
-        if self.resumable and self._rewindable_flag != cur_state:
-            self._reset_checkpoint_state()
-
     def __init__(
             self,
+            md: dict | None = None,
             loop: asyncio.AbstractEventLoop | None = None,  
             scan_id_source: typing.Callable[[dict], SyncOrAsync[int]] = default_scan_id_source
         ):
@@ -268,6 +250,10 @@ class SingleRunExecutor:
         set_bluesky_event_loop(loop)
         self.th = _ensure_event_loop_running(loop)
         self.loop = loop
+
+        if md is None:
+            md = {}
+        self._md = md
 
         self.scan_id_source = scan_id_source
 
@@ -338,6 +324,33 @@ class SingleRunExecutor:
             "install_suspender": self._install_suspender,
             "remove_suspender": self._remove_suspender,
         }
+
+    @property
+    def verbose(self):
+        return not self.log.disabled
+
+    @verbose.setter
+    def verbose(self, value):
+        self.log.disabled = not value
+
+    @property
+    def rewindable(self):
+        return self._rewindable_flag
+
+    @rewindable.setter
+    def rewindable(self, v):
+        cur_state = self._rewindable_flag
+        self._rewindable_flag = bool(v)
+        if self.resumable and self._rewindable_flag != cur_state:
+            self._reset_checkpoint_state()
+
+    @property
+    def md(self):
+        return self._md
+
+    @md.setter
+    def md(self, v):
+        self._md.update(v)
 
     async def _run(self):
         """Pull messages from the plan, process them, send results back.
@@ -717,7 +730,7 @@ class SingleRunExecutor:
             raise IllegalMessageSequence("A 'close_run' message was not received before the 'open_run' message")
 
         # Run scan_id calculation method
-        self.md["scan_id"] = await maybe_await(self.scan_id_source(self.md))
+        self._md["scan_id"] = await maybe_await(self.scan_id_source(self._md))
 
         # For metadata below, info about plan passed to self.__call__ for.
         plan_type = type(self._plan).__name__
@@ -731,7 +744,7 @@ class SingleRunExecutor:
                 "plan_type": plan_type,  # computed from self._plan
                 "plan_name": plan_name,
             },
-            self.md,
+            self._md,
         )  # stateful, persistent metadata
         # The metadata is final. Validate it now, at the last moment.
         self.md_validator(dict(md))
@@ -1849,8 +1862,7 @@ class RunEngine:
         call_returns_result: bool = False,
     ):
         self._single_run_executor = SingleRunExecutor(
-            loop,
-            scan_id_source)
+            md, loop, scan_id_source)
         # When set, RunEngine.__call__ should stop blocking.
         self._blocking_event = threading.Event()
 
@@ -1864,9 +1876,6 @@ class RunEngine:
         self.loop.call_soon_threadsafe(setup_run_permit)
         setup_event.wait()
 
-        if md is None:
-            md = {}
-        self.md = md
         self.md.setdefault("versions", {})
 
         try:
@@ -1887,7 +1896,7 @@ class RunEngine:
 
         self.md["versions"]["bluesky"] = __version__
         self.md["versions"]["event_model"] = event_model.__version__
-
+        
         if preprocessors is None:
             preprocessors = []
         self.preprocessors = preprocessors
@@ -2063,6 +2072,14 @@ class RunEngine:
         # pass through to the Dispatcher, spelled out verbosely here to make
         # sphinx happy -- tricks with __doc__ aren't enough to fool it
         return self.dispatcher.unsubscribe(token)
+
+    @property
+    def md(self):
+        return self._single_run_executor.md
+
+    @md.setter
+    def md(self, v):
+        self._single_run_executor.md = v
 
     @property
     def rewindable(self):
