@@ -260,13 +260,16 @@ class SingleRunExecutor:
 
     def __init__(
             self,
-            loop: asyncio.AbstractEventLoop | None = None,
+            loop: asyncio.AbstractEventLoop | None = None,  
+            scan_id_source: typing.Callable[[dict], SyncOrAsync[int]] = default_scan_id_source
         ):
         if loop is None:
             loop = asyncio.new_event_loop()
         set_bluesky_event_loop(loop)
         self.th = _ensure_event_loop_running(loop)
         self.loop = loop
+
+        self.scan_id_source = scan_id_source
 
         if sys.version_info < (3, 8):  # noqa: UP036
             self.loop_for_kwargs = {"loop": self.loop}
@@ -1845,7 +1848,9 @@ class RunEngine:
         during_task: DuringTask | None = None,
         call_returns_result: bool = False,
     ):
-        self._single_run_executor = SingleRunExecutor(loop)
+        self._single_run_executor = SingleRunExecutor(
+            loop,
+            scan_id_source)
         # When set, RunEngine.__call__ should stop blocking.
         self._blocking_event = threading.Event()
 
@@ -1895,7 +1900,6 @@ class RunEngine:
         if md_normalizer is None:
             md_normalizer = _default_md_normalizer
         self.md_normalizer = md_normalizer
-        self.scan_id_source = scan_id_source
 
         self.max_depth = None
         self.waiting_hook = None
@@ -1951,6 +1955,10 @@ class RunEngine:
     @property
     def state_hook(self):
         return self._single_run_executor.state_hook
+
+    @property
+    def scan_id_source(self):
+        return self._single_run_executor.scan_id_source
 
     @property
     def commands(self):
