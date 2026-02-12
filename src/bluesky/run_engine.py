@@ -289,6 +289,8 @@ class SingleRunExecutor:
         self.response_stack: deque[typing.Any] = deque()  # resps to send into the plans
         self.msg_cache: deque[typing.Any] = deque()  # history of processed msgs for rewinding
 
+        self.run_tracing_spans: list[Span] = []
+        
         self.state_lock = threading.RLock()
 
         # Make a logger for this specific RE instance, using the instance's
@@ -667,6 +669,979 @@ class SingleRunExecutor:
             raise stashed_exception
         return plan_return
 
+
+    async def _wait_for(self, msg):
+        """Instruct the RunEngine to wait for futures and return the resulting tasks.
+
+        Expected message object is:
+
+            Msg('wait_for', None, awaitable_factories, **kwargs)
+
+        The keyword arguments will be passed through to `asyncio.wait`.
+
+        The callables in awaitable_factories must have the signature ::
+
+           def fut_fac() -> awaitable:
+               'This must work multiple times'
+
+        """
+
+        (futs,) = msg.args
+        futs = [asyncio.ensure_future(f()) for f in futs]
+        completed, pending = await asyncio.wait(futs, **self.loop_for_kwargs, **msg.kwargs)
+        if pending:
+            raise WaitForTimeoutError("Plan failed to complete in the specified time")
+        return futs
+
+    async def _open_run(self, msg):
+        """Instruct the RunEngine to start a new "run"
+
+        Expected message object is:
+
+            Msg('open_run', None, **kwargs)
+
+        where **kwargs are any additional metadata that should go into
+        the RunStart document
+        """
+        _span = tracer.start_span(f"{_SPAN_NAME_PREFIX} run")
+        _set_span_msg_attributes(_span, msg)
+
+        self.run_tracing_spans.append(_span)
+
+        # TODO extract this from the Msg
+        run_key = msg.run
+        if run_key in self.run_bundlers:
+            raise IllegalMessageSequence("A 'close_run' message was not received before the 'open_run' message")
+
+        # Run scan_id calculation method
+        self.md["scan_id"] = await maybe_await(self.scan_id_source(self.md))
+
+        # For metadata below, info about plan passed to self.__call__ for.
+        plan_type = type(self._plan).__name__
+        plan_name = getattr(self._plan, "__name__", "")
+
+        # Combine metadata, in order of decreasing precedence:
+        md = ChainMap(
+            self._metadata_per_call,  # from kwargs to self.__call__
+            msg.kwargs,  # from 'open_run' Msg
+            {
+                "plan_type": plan_type,  # computed from self._plan
+                "plan_name": plan_name,
+            },
+            self.md,
+        )  # stateful, persistent metadata
+        # The metadata is final. Validate it now, at the last moment.
+        self.md_validator(dict(md))
+
+        # Apply normalizer at the same level of the validator
+        validated = self.md_normalizer(copy.deepcopy(md))
+
+        current_run = self.run_bundlers[run_key] = type(self).RunBundler(
+            validated,
+            self.record_interruptions,
+            self.emit,
+            self.emit_sync,
+            self.log,
+            strict_pre_declare=self._require_stream_declaration,
+        )
+
+        new_uid = await current_run.open_run(msg)
+        self._run_start_uids.append(new_uid)
+        return new_uid
+
+    async def _close_run(self, msg):
+        """Instruct the RunEngine to write the RunStop document
+
+        Expected message object is:
+
+            Msg('close_run', None, exit_status=None, reason=None)
+
+        if *exit_stats* and *reason* are not provided, use the values
+        stashed on the RE.
+        """
+        # TODO extract this from the Msg
+        run_key = msg.run
+        if (
+            current_run := self.run_bundlers.get(run_key, key_absence_sentinel := object)
+        ) is key_absence_sentinel:
+            ims_msg = "A 'close_run' message was not received before the 'open_run' message"
+            raise IllegalMessageSequence(ims_msg)
+        ret = await current_run.close_run(msg)
+        del self.run_bundlers[run_key]
+        self._close_run_trace(msg)
+        return ret
+
+    def _close_run_trace(self, msg: Msg):
+        exit_status = msg.kwargs.get("exit_status", self._exit_status)
+        reason = msg.kwargs.get("reason", self._reason)
+        try:
+            _span: Span = self.run_tracing_spans.pop()
+            _span.set_attribute("exit_status", exit_status)
+            _span.set_attribute("reason", reason)
+            _span.end()
+        except IndexError:
+            logger.warning("No open traces left to close!")
+
+    async def _create(self, msg):
+        """Trigger the run engine to start bundling future obj.read() calls for
+         an Event document
+
+        Expected message object is:
+
+            Msg('create', None, name='primary')
+            Msg('create', name='primary')
+
+        Note that the `name` kwarg will be the 'name' field of the resulting
+        descriptor. So descriptor['name'] = msg.kwargs['name'].
+
+        Also note that changing the 'name' of the Event will create a new
+        Descriptor document.
+        """
+        run_key = msg.run
+        if (
+            current_run := self.run_bundlers.get(run_key, key_absence_sentinel := object())
+        ) is key_absence_sentinel:
+            ims_msg = (
+                "Cannot bundle readings without an open run. That is, 'create' must be preceded by 'open_run'."
+            )
+            raise IllegalMessageSequence(ims_msg)
+        return await current_run.create(msg)
+
+    async def _declare_stream(self, msg):
+        """Trigger the run engine to start bundling future obj.describe() calls for
+         an Event document
+
+        Expected message object is:
+
+            Msg('declare_stream', None, name='primary')
+            Msg('declare_stream', name='primary')
+            Msg('create', name='primary', collect=True)
+
+        Note that the `name` kwarg will be the 'name' field of the resulting
+        descriptor. So descriptor['name'] = msg.kwargs['name'].
+
+        If `collect` is set to True (default false) then `describe_collect` will be called
+        on declare_stream, rather than `describe`.
+        """
+        run_key = msg.run
+        if (
+            current_run := self.run_bundlers.get(run_key, key_absence_sentinel := object())
+        ) is key_absence_sentinel:
+            ims_msg = (
+                "Cannot bundle readings without an open run. That is, 'create' must be preceded by 'open_run'."
+            )
+            raise IllegalMessageSequence(ims_msg)
+        return await current_run.declare_stream(msg)
+
+    async def _read(self, msg):
+        """
+        Add a reading to the open event bundle.
+
+        Expected message object is:
+
+            Msg('read', obj)
+        """
+        obj = check_supports(msg.obj, Readable)
+        # actually _read_ the object
+        warn_if_msg_args_or_kwargs(msg, obj.read, msg.args, msg.kwargs)
+        ret = await maybe_await(obj.read(*msg.args, **msg.kwargs))
+
+        if ret is None:
+            raise RuntimeError(
+                f"The read of {obj.name} returned None. "
+                "This is a bug in your object implementation, "
+                "`read` must return a dictionary."
+            )
+        run_key = msg.run
+        if (
+            current_run := self.run_bundlers.get(run_key, key_absence_sentinel := object())
+        ) is not key_absence_sentinel:
+            await current_run.read(msg, ret)
+
+        return ret
+
+    async def _locate(self, msg: Msg):
+        """
+        Locate some Movables and return their locations.
+
+        Expected message object is:
+
+            Msg('locate', obj1, ..., objn, squeeze=True)
+
+        If a single obj is passed, obj.locate() is returned. If multiple objs
+        are passed, obj.locate() is called in parallel for all objs and a list
+        of the results returned. If squeeze is supplied and is False then it
+        will always return a list of results even with a single object.
+        """
+        objs = [check_supports(obj, Locatable) for obj in (msg.obj,) + msg.args]
+        # actually _locate_ the objects
+        coros = [maybe_await(obj.locate()) for obj in objs]
+        if len(coros) == 1 and msg.kwargs.get("squeeze", True):
+            return await coros[0]
+        else:
+            return list(await asyncio.gather(*coros))
+
+    async def _monitor(self, msg):
+        """
+        Monitor a signal. Emit event documents asynchronously.
+
+        A descriptor document is emitted immediately. Then, a closure is
+        defined that emits Event documents associated with that descriptor
+        from a separate thread. This process is not related to the main
+        bundling process (create/read/save).
+
+        Expected message object is:
+
+            Msg('monitor', obj, **kwargs)
+            Msg('monitor', obj, name='event-stream-name', **kwargs)
+
+        where kwargs are passed through to ``obj.subscribe()``
+        """
+
+        run_key = msg.run
+        if (
+            current_run := self.run_bundlers.get(run_key, key_absence_sentinel := object())
+        ) is key_absence_sentinel:
+            ims_msg = "A 'monitor' message was sent but no run is open."
+            raise IllegalMessageSequence(ims_msg)
+        else:
+            await current_run.monitor(msg)
+        await self._reset_checkpoint_state_coro()
+
+    async def _unmonitor(self, msg):
+        """
+        Stop monitoring; i.e., remove the callback emitting event documents.
+
+        Expected message object is:
+
+            Msg('unmonitor', obj)
+        """
+        run_key = msg.run
+        if (
+            current_run := self.run_bundlers.get(run_key, key_absence_sentinel := object())
+        ) is key_absence_sentinel:
+            ims_msg = "An 'unmonitor' message was sent but no run is open."
+            raise IllegalMessageSequence(ims_msg)
+        else:
+            await current_run.unmonitor(msg)
+        await self._reset_checkpoint_state_coro()
+
+    async def _save(self, msg):
+        """Save the event that is currently being bundled
+
+        Expected message object is:
+
+            Msg('save')
+        """
+        run_key = msg.run
+        if (
+            current_run := self.run_bundlers.get(run_key, key_absence_sentinel := object())
+        ) is key_absence_sentinel:
+            # sanity check -- this should be caught by 'create' which makes
+            # this code path impossible
+            ims_msg = "A 'save' message was sent but no run is open."
+            raise IllegalMessageSequence(ims_msg)
+        else:
+            await current_run.save(msg)
+
+    async def _drop(self, msg):
+        """Drop the event that is currently being bundled
+
+        Expected message object is:
+
+            Msg('drop')
+        """
+        run_key = msg.run
+        if (
+            current_run := self.run_bundlers.get(run_key, key_absence_sentinel := object())
+        ) is key_absence_sentinel:
+            ims_msg = "A 'drop' message was sent but no run is open."
+            raise IllegalMessageSequence(ims_msg)
+        else:
+            await current_run.drop(msg)
+
+    async def _prepare(self, msg):
+        """Prepare a flyer for a flyscan
+
+        Expected message object is:
+
+        If `flyer_object` obeys the Preparable protocol, it should have a .prepare
+        method that takes an argument to be set:
+
+            Msg('prepare', flyer_object, value)
+
+        Where value represents an initial state to move the flyer to.
+        """
+        obj = check_supports(msg.obj, Preparable)
+        kwargs = dict(msg.kwargs)
+        group = kwargs.pop("group", None)
+        ret = obj.prepare(*msg.args, **kwargs)
+
+        self._add_status_to_group(obj=obj, status_object=ret, group=group, action="prepare")
+
+        return ret
+
+    async def _kickoff(self, msg):
+        """Start a flyscan object
+
+        Special kwargs for the 'Msg' object in this function:
+        group : str
+            The blocking group to this flyer to
+
+        Expected message object is:
+
+        If `flyer_object` has a `kickoff` function that takes no arguments:
+
+            Msg('kickoff', flyer_object)
+            Msg('kickoff', flyer_object, group=<name>)
+
+        If `flyer_object` has a `kickoff` function that takes
+        `(start, stop, steps)` as its function arguments:
+
+            Msg('kickoff', flyer_object, start, stop, step)
+            Msg('kickoff', flyer_object, start, stop, step, group=<name>)
+        """
+        run_key = msg.run
+        if (
+            current_run := self.run_bundlers.get(run_key, key_absence_sentinel := object())
+        ) is key_absence_sentinel:
+            ims_msg = "A 'kickoff' message was sent but no run is open."
+            raise IllegalMessageSequence(ims_msg)
+
+        _, obj, args, kwargs, _ = msg
+        obj = check_supports(obj, Flyable)
+        kwargs = dict(msg.kwargs)
+        group = kwargs.pop("group", None)
+        warn_if_msg_args_or_kwargs(msg, obj.kickoff, msg.args, kwargs)
+        ret = obj.kickoff(*msg.args, **kwargs)
+        await current_run.kickoff(msg)
+
+        self._add_status_to_group(obj=obj, status_object=ret, group=group, action="kickoff")
+
+        return ret
+
+    @tracer.start_as_current_span(f"{_SPAN_NAME_PREFIX} complete")
+    async def _complete(self, msg):
+        """
+        Tell a flyer, 'stop collecting, whenever you are ready'.
+
+        The flyer returns a status object. Some flyers respond to this
+        command by stopping collection and returning a finished status
+        object immediately. Other flyers finish their given course and
+        finish whenever they finish, irrespective of when this command is
+        issued.
+
+        Expected message object is:
+
+            Msg('complete', flyer, group=<GROUP>)
+
+        where <GROUP> is a hashable identifier.
+        """
+        _set_span_msg_attributes(trace.get_current_span(), msg)
+        kwargs = dict(msg.kwargs)
+        group = kwargs.pop("group", None)
+        obj = check_supports(msg.obj, Flyable)
+        warn_if_msg_args_or_kwargs(msg, obj.complete, msg.args, kwargs)
+        ret = obj.complete(*msg.args, **kwargs)
+
+        self._add_status_to_group(obj=obj, status_object=ret, group=group, action="complete")
+
+        return ret
+
+    @tracer.start_as_current_span(f"{_SPAN_NAME_PREFIX} collect")
+    async def _collect(self, msg):
+        """
+        Collect data cached by a flyer and emit documents
+
+        Expected message object is:
+
+            Msg('collect', flyer_object)
+            Msg('collect', flyer_object, stream=True, return_payload=False, name="a_name")
+        """
+        _set_span_msg_attributes(trace.get_current_span(), msg)
+        run_key = msg.run
+        if (
+            current_run := self.run_bundlers.get(run_key, key_absence_sentinel := object())
+        ) is key_absence_sentinel:
+            # TODO add test exercising this path
+            ims_msg = "A 'collect' message was sent but no run is open."
+            raise IllegalMessageSequence(ims_msg)
+
+        return await current_run.collect(msg)
+
+    async def _null(self, msg):
+        """
+        A no-op message, mainly for debugging and testing.
+        """
+        pass
+
+    async def _RE_class(self, msg):
+        """
+        A no-op message, mainly for debugging and testing.
+        """
+        return type(self)
+
+    @tracer.start_as_current_span(f"{_SPAN_NAME_PREFIX} set")
+    async def _set(self, msg):
+        """
+        Set a device and cache the returned status object.
+
+        Also, note that the device has been touched so it can be stopped upon
+        exit.
+
+        Expected message object is
+
+            Msg('set', obj, *args, **kwargs)
+
+        where arguments are passed through to `obj.set(*args, **kwargs)`.
+        """
+        _set_span_msg_attributes(trace.get_current_span(), msg)
+        obj = check_supports(msg.obj, Movable)
+        kwargs = dict(msg.kwargs)
+        group = kwargs.pop("group", None)
+        self.movable_objs_touched.add(obj)
+        ret = obj.set(*msg.args, **kwargs)
+
+        self._add_status_to_group(obj=obj, status_object=ret, group=group, action="set")
+
+        return ret
+
+    async def _trigger(self, msg):
+        """
+        Trigger a device and cache the returned status object.
+
+        Expected message object is:
+
+            Msg('trigger', obj)
+        """
+        obj = check_supports(msg.obj, Triggerable)
+        kwargs = dict(msg.kwargs)
+        group = kwargs.pop("group", None)
+        warn_if_msg_args_or_kwargs(msg, obj.trigger, msg.args, kwargs)
+        ret = obj.trigger(*msg.args, **kwargs)
+
+        self._add_status_to_group(obj=obj, status_object=ret, group=group, action="trigger")
+
+        return ret
+
+    def _call_waiting_hook(self, *args, **kwargs):
+        if self.waiting_hook is not None:
+            self.waiting_hook(*args, **kwargs)
+
+    @tracer.start_as_current_span(f"{_SPAN_NAME_PREFIX} wait")
+    async def _wait(self, msg: Msg) -> bool:
+        """Block progress until every object that was triggered or set
+        with the keyword argument `group=<GROUP>` is done. Returns a boolean that is
+        true when all triggered objects are done. When the keyword argument
+        `error_on_timeout=<error_on_timeout>` is false, this method can return before all objects are done
+        after a flush period given by the `timeout=<TIMEOUT>` keyword argument.
+
+        Expected message object is:
+
+            Msg('wait', group=<GROUP>, error_on_timeout=<ERROR_ON_TIMEOUT>)
+
+        where ``<GROUP>`` is any hashable key and ``<ERROR_ON_TIMEOUT>`` is a boolean.
+        """
+        _set_span_msg_attributes(trace.get_current_span(), msg)
+        done = False  # boolean that tracks whether waiting is complete
+        if msg.args:
+            (group,) = msg.args
+        else:
+            group = msg.kwargs["group"]
+        error_on_timeout = msg.kwargs.get("error_on_timeout", True)
+        watch = msg.kwargs.get("watch", ())
+        watch_task: asyncio.Task | None = None
+        if group:
+            trace.get_current_span().set_attribute("group", group)
+        else:
+            trace.get_current_span().set_attribute("no_group_given", True)
+        futs = self._groups.pop(group, set())
+        if futs:
+            status_objs = self._status_objs.pop(group)
+            try:
+                if not error_on_timeout:
+                    if group not in self._seen_wait_and_move_on_keys:
+                        self._seen_wait_and_move_on_keys.add(group)
+                        self._call_waiting_hook(status_objs)
+                else:  # if error_on_timeout False
+                    # Notify the waiting_hook function that the RunEngine is
+                    # waiting for these status_objs to complete. Users can use
+                    # the information these encapsulate to create a progress
+                    # bar.
+                    self._call_waiting_hook(status_objs)
+
+                async def wait_for_first_exception(futures: set) -> list[asyncio.Future]:
+                    return await self._wait_for(
+                        Msg(
+                            "wait_for",
+                            None,
+                            futures,
+                            return_when=asyncio.FIRST_EXCEPTION,
+                            timeout=msg.kwargs.get("timeout", None),
+                        )
+                    )
+
+                # Create the task waiting for the given group of statuses to complete
+                # or one of them to fail
+                status_task = asyncio.create_task(wait_for_first_exception(futs))
+                if watch:
+                    # Create a task that waits for an exception on any watch group
+                    # so we know whether to stop the wait early because of a watcher failure
+                    watch_futs = set()
+                    for w in watch:
+                        watch_futs.update(self._groups.get(w, set()))
+                    watch_task = asyncio.create_task(wait_for_first_exception(watch_futs))
+
+                    def cancel_status_task_if_error(fut: asyncio.Future[list[asyncio.Future]]):
+                        # If _wait_for raised an exception, or if any of the status
+                        # objects in the watch groups failed, cancel the status_task.
+                        if fut.exception() or any(f.exception() for f in fut.result()):
+                            status_task.cancel()
+
+                    watch_task.add_done_callback(cancel_status_task_if_error)
+                await status_task
+            except WaitForTimeoutError:
+                # We might wait to call wait again, so put the futures and status objects back in
+                self._groups[group] = futs
+                self._status_objs[group] = status_objs
+                if error_on_timeout:
+                    raise
+            finally:
+                if watch_task:
+                    watch_task.cancel()
+                if error_on_timeout:
+                    # Notify the waiting_hook function that we have moved on by
+                    # sending it `None`. If all goes well, it could have
+                    # inferred this from the status_obj, but there are edge
+                    # cases.
+                    self._call_waiting_hook(None)
+                    done = True
+                else:
+                    done = all(obj.done for obj in status_objs)
+                    if done:
+                        self._call_waiting_hook(None)
+                        self._seen_wait_and_move_on_keys.remove(group)
+        else:
+            done = True
+        return done
+
+    def _status_object_completed(self, ret, fut: asyncio.Future, pardon_failures):
+        """
+        Task to run when a status object is finished.
+
+        Parameters
+        ----------
+        ret : status object
+        p_event : asyncio.Event
+            held in the RunEngine's self._groups cache for waiting
+        pardon_failuers : asyncio.Event
+            tells us whether the __call__ this status object is over
+        """
+        if not ret.success and not pardon_failures.is_set():
+            # TODO: need a better channel to move this information back
+            # to the run task.
+            with self.state_lock:
+                try:
+                    exc = ret.exception(timeout=0)
+                    raise FailedStatus(ret) from exc
+                except Exception as e:
+                    self.exception = e
+                    fut.set_exception(e)
+                    # We have set the exception, but we don't mind if
+                    # no-one collects it from the future, so fetch it ourselves to
+                    # squash "Future exception was never retrieved" at teardown.
+                    fut.exception()
+        else:
+            fut.set_result(None)
+
+    async def _sleep(self, msg):
+        """
+        Sleep the event loop.
+
+        Expected message object is:
+
+            Msg('sleep', None, sleep_time)
+
+        where `sleep_time` is in seconds
+        """
+        await asyncio.sleep(*msg.args, **self.loop_for_kwargs)
+
+    async def _pause(self, msg):
+        """Request the run engine to pause
+
+        Expected message object is:
+
+            Msg('pause', defer=False, name=None, callback=None)
+
+        See RunEngine.request_pause() docstring for explanation of the three
+        keyword arguments in the `Msg` signature
+        """
+        await self._request_pause_coro(*msg.args, **msg.kwargs)
+
+    async def _resume(self, msg):
+        """Request the run engine to resume
+
+        Expected message object is:
+
+            Msg('resume', defer=False, name=None, callback=None)
+
+        See RunEngine.resume() docstring for explanation of the three
+        keyword arguments in the `Msg` signature
+        """
+        # Re-instate monitoring callbacks.
+        for current_run in self.run_bundlers.values():
+            await current_run.restore_monitors()
+        # Notify Devices of the resume in case they want to clean up.
+        for obj in self.objs_seen:
+            if isinstance(obj, Pausable):
+                await maybe_await(obj.resume())
+
+    async def _checkpoint(self, msg):
+        """Instruct the RunEngine to create a checkpoint so that we can rewind
+        to this point if necessary
+
+        Expected message object is:
+
+            Msg('checkpoint')
+        """
+        for current_run in self.run_bundlers.values():
+            if current_run.bundling:
+                raise IllegalMessageSequence("Cannot 'checkpoint' after 'create' and before 'save'. Aborting!")
+
+        await self._reset_checkpoint_state_coro()
+
+        if self._deferred_pause_requested:
+            # We are at a checkpoint; we are done deferring the pause.
+            # Give the _check_for_signals coroutine time to look for
+            # additional SIGINTs that would trigger an abort.
+            await asyncio.sleep(0.5, **self.loop_for_kwargs)
+            await self._request_pause_coro(defer=False)
+
+    def _reset_checkpoint_state(self):
+        self._reset_checkpoint_state_meth()
+
+    def _reset_checkpoint_state_meth(self):
+        if self.msg_cache is None:
+            return
+
+        self.msg_cache = deque()
+        for current_run in self.run_bundlers.values():
+            current_run.reset_checkpoint_state()
+
+    async def _reset_checkpoint_state_coro(self):
+        self._reset_checkpoint_state()
+
+    async def _clear_checkpoint(self, msg):
+        """Clear a set checkpoint
+
+        Expected message object is:
+
+            Msg('clear_checkpoint')
+        """
+        # clear message cache
+        self.msg_cache = None
+        # clear stashed
+        for current_run in self.run_bundlers.values():
+            await current_run.clear_checkpoint(msg)
+
+    async def _rewindable(self, msg):
+        """Set rewindable state of RunEngine
+
+        Expected message object is:
+
+            Msg('rewindable', None, bool or None)
+        """
+
+        (rw_flag,) = msg.args
+        if rw_flag is not None:
+            self.rewindable = rw_flag
+
+        return self.rewindable
+
+    async def _configure(self, msg):
+        """Configure an object
+
+        Expected message object is:
+
+            Msg('configure', object, *args, **kwargs)
+
+        which results in this call:
+
+            object.configure(*args, **kwargs)
+        """
+        run_key = msg.run
+        if (
+            current_run := self.run_bundlers.get(run_key, key_absence_sentinel := object())
+        ) is key_absence_sentinel:
+            current_run = None
+        elif current_run.bundling:
+            ims_msg = "Cannot configure after 'create' but before 'save' Aborting!"
+            raise IllegalMessageSequence(ims_msg)
+        _, obj, args, kwargs, _ = msg
+
+        old, new = obj.configure(*args, **kwargs)
+        if current_run:
+            await current_run.configure(msg)
+        return old, new
+
+    def _add_status_to_group(self, obj: typing.Any, status_object: Status, group: str, action: str) -> None:
+        fut = self.loop.create_future()
+        pardon_failures = self._sinle_run_executor.pardon_failures
+
+        def done_callback(status: Status):
+            self.log.debug("The object %r reports %r is done with status %r.", obj, action, status_object.success)
+            self.loop.call_soon_threadsafe(self._status_object_completed, status_object, fut, pardon_failures)
+
+        try:
+            status_object.add_callback(done_callback)
+        except AttributeError:
+            # for ophyd < v0.8.0
+            status_object.finished_cb = done_callback  # type: ignore
+
+        self._groups[group].add(lambda: fut)
+        self._status_objs[group].add(status_object)
+
+    async def _stage(self, msg):
+        """Instruct the RunEngine to stage the object
+
+        Expected message object is:
+
+            Msg('stage', object)
+        """
+        _, obj, args, kwargs, _ = msg
+        # If an object has no 'stage' method, assume there is nothing to do.
+        if not isinstance(obj, Stageable):
+            return []
+        group = kwargs.pop("group", None)
+        ret = obj.stage()
+        self.staged.add(obj)  # add first in case of failure below
+        await self._reset_checkpoint_state_coro()
+
+        if not isinstance(ret, Status):
+            return ret
+
+        self._add_status_to_group(obj=obj, status_object=ret, group=group, action="stage")
+
+        return ret
+
+    async def _unstage(self, msg):
+        """Instruct the RunEngine to unstage the object
+
+        Expected message object is:
+
+            Msg('unstage', object)
+        """
+        _, obj, args, kwargs, _ = msg
+        # If an object has no 'unstage' method, assume there is nothing to do.
+        if not isinstance(obj, Stageable):
+            return []
+        group = kwargs.pop("group", None)
+        ret = obj.unstage()
+        # use `discard()` to ignore objects that are not in the staged set.
+        self.staged.discard(obj)
+        await self._reset_checkpoint_state_coro()
+
+        if not isinstance(ret, Status):
+            return ret
+
+        self._add_status_to_group(obj=obj, status_object=ret, group=group, action="unstage")
+
+        return ret
+
+    async def _stop(self, msg):
+        """
+        Stop a device.
+
+        Expected message object is:
+
+            Msg('stop', obj)
+        """
+        obj = check_supports(msg.obj, Stoppable)
+        return await maybe_await(obj.stop())  # nominally, this returns None
+
+    async def _subscribe(self, msg):
+        """
+        Add a subscription after the run has started.
+
+        This, like subscriptions passed to __call__, will be removed at the
+        end by the RunEngine.
+
+        Expected message object is:
+
+            Msg('subscribe', None, callback_function, document_name)
+
+        where `document_name` is one of:
+
+            {'start', 'descriptor', 'event', 'stop', 'all'}
+
+        and `callback_function` is expected to have a signature of:
+
+            ``f(name, document)``
+
+            where name is one of the ``document_name`` options and ``document``
+            is one of the document dictionaries in the event model.
+
+        See the docstring of bluesky.run_engine.Dispatcher.subscribe() for more
+        information.
+        """
+        self.log.debug("Adding subscription %r", msg)
+        _, obj, args, kwargs, _ = msg
+        token = self.subscribe(*args, **kwargs)
+        self._temp_callback_ids.add(token)
+        await self._reset_checkpoint_state_coro()
+        return token
+
+    async def _unsubscribe(self, msg):
+        """
+        Remove a subscription during a call -- useful for a multi-run call
+        where subscriptions are wanted for some runs but not others.
+
+        Expected message object is:
+
+            Msg('unsubscribe', None, TOKEN)
+            Msg('unsubscribe', token=TOKEN)
+
+        where ``TOKEN`` is the return value from ``RunEngine._subscribe()``
+        """
+        self.log.debug("Removing subscription %r", msg)
+        _, obj, arg, kwargs, _ = msg
+        if (token := kwargs.get("token", key_absence_sentinel := object())) is key_absence_sentinel:
+            (token,) = arg
+        self.unsubscribe(token)
+        self._temp_callback_ids.remove(token)
+        await self._reset_checkpoint_state_coro()
+
+    async def _input(self, msg):
+        """
+        Process a 'input' Msg. Expected Msg:
+
+            Msg('input', None)
+            Msg('input', None, prompt='>')  # customize prompt
+        """
+        prompt = msg.kwargs.get("prompt", "")
+        async_input = AsyncInput(self.loop)
+        async_input = functools.partial(async_input, end="", flush=True)
+        return await async_input(prompt)
+    def install_suspender(self, suspender):
+        """
+        Install a 'suspender', which can suspend and resume execution.
+
+        Parameters
+        ----------
+        suspender : `bluesky.suspenders.SuspenderBase`
+
+        See Also
+        --------
+        :meth:`RunEngine.remove_suspender`
+        :meth:`RunEngine.clear_suspenders`
+        """
+        self._suspenders.add(suspender)
+        suspender.install(self)
+
+    async def _install_suspender(self, msg):
+        """
+        See :meth: `RunEngine.install_suspender`
+
+        Expected message object is:
+
+            Msg('install_suspender', None, suspender)
+        """
+        suspender = msg.args[0]
+        self.install_suspender(suspender)
+
+    def remove_suspender(self, suspender):
+        """
+        Uninstall a suspender.
+
+        Parameters
+        ----------
+        suspender : `bluesky.suspenders.SuspenderBase`
+
+        See Also
+        --------
+        :meth:`RunEngine.install_suspender`
+        :meth:`RunEngine.clear_suspenders`
+        """
+        if suspender in self._suspenders:
+            suspender.remove()
+        self._suspenders.discard(suspender)
+
+    async def _remove_suspender(self, msg):
+        """
+        See :meth: `RunEngine.remove_suspender`
+
+        Expected message object is:
+
+            Msg('remove_suspender', None, suspender)
+        """
+        suspender = msg.args[0]
+        self.remove_suspender(suspender)
+
+    async def _start_suspender(self, msg):
+        """
+        An internal message to do the initial work of starting a suspender
+        """
+        pre_plan, post_plan, justification, fut = msg.args
+        for current_run in self.run_bundlers.values():
+            current_run.record_interruption(justification if justification is not None else "suspended")
+        # During suspend, all motors should be stopped. Call stop() on
+        # every object we ever set().
+        await self.stop_movable_objects(success=True)
+        # Notify Devices of the pause in case they want to clean up.
+        for obj in self.objs_seen:
+            if hasattr(obj, "pause"):
+                try:
+                    await maybe_await(obj.pause())
+                except NoReplayAllowed:
+                    self._reset_checkpoint_state_meth()
+        # rewind to the last checkpoint
+        rewind_plan = self._rewind()
+        was_rewindable = self.rewindable
+
+        if callable(pre_plan):
+            pre_plan = pre_plan()
+        if callable(post_plan):
+            post_plan = post_plan()
+
+        def suspender_helper_inner_plan():
+            # none of this should run again.
+            yield Msg("rewindable", None, False)
+            # if there is a pre plan add on top of the wait
+            if pre_plan is not None:
+                yield from ensure_generator(pre_plan)
+            # wait for the future from the suspender to be released
+            yield Msg(
+                "wait_for",
+                None,
+                [
+                    fut,
+                ],
+            )
+            # do the work we need to do to resume
+            yield Msg(
+                "_resume_from_suspender",
+                None,
+            )
+            # if there is a post plan, run it
+            if post_plan is not None:
+                yield from ensure_generator(post_plan)
+            # put rewindable back the way it was
+            yield Msg("rewindable", None, was_rewindable)
+            yield from rewind_plan
+
+        # add the above helper to the plan stack
+        self.plan_stack.append(suspender_helper_inner_plan())
+        self.response_stack.append(None)
+
+    def emit_sync(self, name, doc):
+        "Process blocking callbacks and schedule non-blocking callbacks."
+
+        # Process the doc, already validated against the schema in event-model
+        self.dispatcher.process(name, doc)
+
+    async def emit(self, name, doc):
+        self.emit_sync(name, doc)
+
     async def stop_movable_objects(self, *, success=True):
         "Call obj.stop() for all objects we have moved. Log any exceptions."
         for obj in self.movable_objs_touched:
@@ -873,8 +1848,6 @@ class RunEngine:
         self._single_run_executor = SingleRunExecutor(loop)
         # When set, RunEngine.__call__ should stop blocking.
         self._blocking_event = threading.Event()
-
-        self._run_tracing_spans: list[Span] = []
 
         setup_event = threading.Event()
 
@@ -1522,61 +2495,6 @@ class RunEngine:
                     plan_return = None
             return plan_return
 
-    def install_suspender(self, suspender):
-        """
-        Install a 'suspender', which can suspend and resume execution.
-
-        Parameters
-        ----------
-        suspender : `bluesky.suspenders.SuspenderBase`
-
-        See Also
-        --------
-        :meth:`RunEngine.remove_suspender`
-        :meth:`RunEngine.clear_suspenders`
-        """
-        self._suspenders.add(suspender)
-        suspender.install(self)
-
-    async def _install_suspender(self, msg):
-        """
-        See :meth: `RunEngine.install_suspender`
-
-        Expected message object is:
-
-            Msg('install_suspender', None, suspender)
-        """
-        suspender = msg.args[0]
-        self.install_suspender(suspender)
-
-    def remove_suspender(self, suspender):
-        """
-        Uninstall a suspender.
-
-        Parameters
-        ----------
-        suspender : `bluesky.suspenders.SuspenderBase`
-
-        See Also
-        --------
-        :meth:`RunEngine.install_suspender`
-        :meth:`RunEngine.clear_suspenders`
-        """
-        if suspender in self._suspenders:
-            suspender.remove()
-        self._suspenders.discard(suspender)
-
-    async def _remove_suspender(self, msg):
-        """
-        See :meth: `RunEngine.remove_suspender`
-
-        Expected message object is:
-
-            Msg('remove_suspender', None, suspender)
-        """
-        suspender = msg.args[0]
-        self.remove_suspender(suspender)
-
     def clear_suspenders(self):
         """
         Uninstall all suspenders.
@@ -1645,62 +2563,6 @@ class RunEngine:
                 self._task.cancel()
 
         self.loop.call_soon_threadsafe(self.loop.create_task, _request_suspend(pre_plan, post_plan, justification))
-
-    async def _start_suspender(self, msg):
-        """
-        An internal message to do the initial work of starting a suspender
-        """
-        pre_plan, post_plan, justification, fut = msg.args
-        for current_run in self._single_run_executor.run_bundlers.values():
-            current_run.record_interruption(justification if justification is not None else "suspended")
-        # During suspend, all motors should be stopped. Call stop() on
-        # every object we ever set().
-        await self._single_run_executor.stop_movable_objects(success=True)
-        # Notify Devices of the pause in case they want to clean up.
-        for obj in self._single_run_executor.objs_seen:
-            if hasattr(obj, "pause"):
-                try:
-                    await maybe_await(obj.pause())
-                except NoReplayAllowed:
-                    self._reset_checkpoint_state_meth()
-        # rewind to the last checkpoint
-        rewind_plan = self._rewind()
-        was_rewindable = self.rewindable
-
-        if callable(pre_plan):
-            pre_plan = pre_plan()
-        if callable(post_plan):
-            post_plan = post_plan()
-
-        def suspender_helper_inner_plan():
-            # none of this should run again.
-            yield Msg("rewindable", None, False)
-            # if there is a pre plan add on top of the wait
-            if pre_plan is not None:
-                yield from ensure_generator(pre_plan)
-            # wait for the future from the suspender to be released
-            yield Msg(
-                "wait_for",
-                None,
-                [
-                    fut,
-                ],
-            )
-            # do the work we need to do to resume
-            yield Msg(
-                "_resume_from_suspender",
-                None,
-            )
-            # if there is a post plan, run it
-            if post_plan is not None:
-                yield from ensure_generator(post_plan)
-            # put rewindable back the way it was
-            yield Msg("rewindable", None, was_rewindable)
-            yield from rewind_plan
-
-        # add the above helper to the plan stack
-        self._single_run_executor.plan_stack.append(suspender_helper_inner_plan())
-        self._single_run_executor.response_stack.append(None)
 
     def abort(self, reason=""):
         """
@@ -1852,873 +2714,10 @@ class RunEngine:
             return tuple(self._run_start_uids)
 
     def _destroy_open_run_tracing_spans(self):
-        while len(self._run_tracing_spans):
-            _span = self._run_tracing_spans.pop()
+        while len(self._single_run_executor.run_tracing_spans):
+            _span = self._single_run_executor.run_tracing_spans.pop()
             _span.set_attribute("exit_status", "aborted")
             _span.end()
-
-
-    async def _wait_for(self, msg):
-        """Instruct the RunEngine to wait for futures and return the resulting tasks.
-
-        Expected message object is:
-
-            Msg('wait_for', None, awaitable_factories, **kwargs)
-
-        The keyword arguments will be passed through to `asyncio.wait`.
-
-        The callables in awaitable_factories must have the signature ::
-
-           def fut_fac() -> awaitable:
-               'This must work multiple times'
-
-        """
-
-        (futs,) = msg.args
-        futs = [asyncio.ensure_future(f()) for f in futs]
-        completed, pending = await asyncio.wait(futs, **self._single_run_executor.loop_for_kwargs, **msg.kwargs)
-        if pending:
-            raise WaitForTimeoutError("Plan failed to complete in the specified time")
-        return futs
-
-    async def _open_run(self, msg):
-        """Instruct the RunEngine to start a new "run"
-
-        Expected message object is:
-
-            Msg('open_run', None, **kwargs)
-
-        where **kwargs are any additional metadata that should go into
-        the RunStart document
-        """
-        _span = tracer.start_span(f"{_SPAN_NAME_PREFIX} run")
-        _set_span_msg_attributes(_span, msg)
-
-        self._run_tracing_spans.append(_span)
-
-        # TODO extract this from the Msg
-        run_key = msg.run
-        if run_key in self._single_run_executor.run_bundlers:
-            raise IllegalMessageSequence("A 'close_run' message was not received before the 'open_run' message")
-
-        # Run scan_id calculation method
-        self.md["scan_id"] = await maybe_await(self.scan_id_source(self.md))
-
-        # For metadata below, info about plan passed to self.__call__ for.
-        plan_type = type(self._plan).__name__
-        plan_name = getattr(self._plan, "__name__", "")
-
-        # Combine metadata, in order of decreasing precedence:
-        md = ChainMap(
-            self._metadata_per_call,  # from kwargs to self.__call__
-            msg.kwargs,  # from 'open_run' Msg
-            {
-                "plan_type": plan_type,  # computed from self._plan
-                "plan_name": plan_name,
-            },
-            self.md,
-        )  # stateful, persistent metadata
-        # The metadata is final. Validate it now, at the last moment.
-        self.md_validator(dict(md))
-
-        # Apply normalizer at the same level of the validator
-        validated = self.md_normalizer(copy.deepcopy(md))
-
-        current_run = self._single_run_executor.run_bundlers[run_key] = type(self).RunBundler(
-            validated,
-            self.record_interruptions,
-            self.emit,
-            self.emit_sync,
-            self.log,
-            strict_pre_declare=self._require_stream_declaration,
-        )
-
-        new_uid = await current_run.open_run(msg)
-        self._run_start_uids.append(new_uid)
-        return new_uid
-
-    async def _close_run(self, msg):
-        """Instruct the RunEngine to write the RunStop document
-
-        Expected message object is:
-
-            Msg('close_run', None, exit_status=None, reason=None)
-
-        if *exit_stats* and *reason* are not provided, use the values
-        stashed on the RE.
-        """
-        # TODO extract this from the Msg
-        run_key = msg.run
-        if (
-            current_run := self._single_run_executor.run_bundlers.get(run_key, key_absence_sentinel := object)
-        ) is key_absence_sentinel:
-            ims_msg = "A 'close_run' message was not received before the 'open_run' message"
-            raise IllegalMessageSequence(ims_msg)
-        ret = await current_run.close_run(msg)
-        del self._single_run_executor.run_bundlers[run_key]
-        self._close_run_trace(msg)
-        return ret
-
-    def _close_run_trace(self, msg: Msg):
-        exit_status = msg.kwargs.get("exit_status", self._exit_status)
-        reason = msg.kwargs.get("reason", self._reason)
-        try:
-            _span: Span = self._run_tracing_spans.pop()
-            _span.set_attribute("exit_status", exit_status)
-            _span.set_attribute("reason", reason)
-            _span.end()
-        except IndexError:
-            logger.warning("No open traces left to close!")
-
-    async def _create(self, msg):
-        """Trigger the run engine to start bundling future obj.read() calls for
-         an Event document
-
-        Expected message object is:
-
-            Msg('create', None, name='primary')
-            Msg('create', name='primary')
-
-        Note that the `name` kwarg will be the 'name' field of the resulting
-        descriptor. So descriptor['name'] = msg.kwargs['name'].
-
-        Also note that changing the 'name' of the Event will create a new
-        Descriptor document.
-        """
-        run_key = msg.run
-        if (
-            current_run := self._single_run_executor.run_bundlers.get(run_key, key_absence_sentinel := object())
-        ) is key_absence_sentinel:
-            ims_msg = (
-                "Cannot bundle readings without an open run. That is, 'create' must be preceded by 'open_run'."
-            )
-            raise IllegalMessageSequence(ims_msg)
-        return await current_run.create(msg)
-
-    async def _declare_stream(self, msg):
-        """Trigger the run engine to start bundling future obj.describe() calls for
-         an Event document
-
-        Expected message object is:
-
-            Msg('declare_stream', None, name='primary')
-            Msg('declare_stream', name='primary')
-            Msg('create', name='primary', collect=True)
-
-        Note that the `name` kwarg will be the 'name' field of the resulting
-        descriptor. So descriptor['name'] = msg.kwargs['name'].
-
-        If `collect` is set to True (default false) then `describe_collect` will be called
-        on declare_stream, rather than `describe`.
-        """
-        run_key = msg.run
-        if (
-            current_run := self._single_run_executor.run_bundlers.get(run_key, key_absence_sentinel := object())
-        ) is key_absence_sentinel:
-            ims_msg = (
-                "Cannot bundle readings without an open run. That is, 'create' must be preceded by 'open_run'."
-            )
-            raise IllegalMessageSequence(ims_msg)
-        return await current_run.declare_stream(msg)
-
-    async def _read(self, msg):
-        """
-        Add a reading to the open event bundle.
-
-        Expected message object is:
-
-            Msg('read', obj)
-        """
-        obj = check_supports(msg.obj, Readable)
-        # actually _read_ the object
-        warn_if_msg_args_or_kwargs(msg, obj.read, msg.args, msg.kwargs)
-        ret = await maybe_await(obj.read(*msg.args, **msg.kwargs))
-
-        if ret is None:
-            raise RuntimeError(
-                f"The read of {obj.name} returned None. "
-                "This is a bug in your object implementation, "
-                "`read` must return a dictionary."
-            )
-        run_key = msg.run
-        if (
-            current_run := self._single_run_executor.run_bundlers.get(run_key, key_absence_sentinel := object())
-        ) is not key_absence_sentinel:
-            await current_run.read(msg, ret)
-
-        return ret
-
-    async def _locate(self, msg: Msg):
-        """
-        Locate some Movables and return their locations.
-
-        Expected message object is:
-
-            Msg('locate', obj1, ..., objn, squeeze=True)
-
-        If a single obj is passed, obj.locate() is returned. If multiple objs
-        are passed, obj.locate() is called in parallel for all objs and a list
-        of the results returned. If squeeze is supplied and is False then it
-        will always return a list of results even with a single object.
-        """
-        objs = [check_supports(obj, Locatable) for obj in (msg.obj,) + msg.args]
-        # actually _locate_ the objects
-        coros = [maybe_await(obj.locate()) for obj in objs]
-        if len(coros) == 1 and msg.kwargs.get("squeeze", True):
-            return await coros[0]
-        else:
-            return list(await asyncio.gather(*coros))
-
-    async def _monitor(self, msg):
-        """
-        Monitor a signal. Emit event documents asynchronously.
-
-        A descriptor document is emitted immediately. Then, a closure is
-        defined that emits Event documents associated with that descriptor
-        from a separate thread. This process is not related to the main
-        bundling process (create/read/save).
-
-        Expected message object is:
-
-            Msg('monitor', obj, **kwargs)
-            Msg('monitor', obj, name='event-stream-name', **kwargs)
-
-        where kwargs are passed through to ``obj.subscribe()``
-        """
-
-        run_key = msg.run
-        if (
-            current_run := self._single_run_executor.run_bundlers.get(run_key, key_absence_sentinel := object())
-        ) is key_absence_sentinel:
-            ims_msg = "A 'monitor' message was sent but no run is open."
-            raise IllegalMessageSequence(ims_msg)
-        else:
-            await current_run.monitor(msg)
-        await self._reset_checkpoint_state_coro()
-
-    async def _unmonitor(self, msg):
-        """
-        Stop monitoring; i.e., remove the callback emitting event documents.
-
-        Expected message object is:
-
-            Msg('unmonitor', obj)
-        """
-        run_key = msg.run
-        if (
-            current_run := self._single_run_executor.run_bundlers.get(run_key, key_absence_sentinel := object())
-        ) is key_absence_sentinel:
-            ims_msg = "An 'unmonitor' message was sent but no run is open."
-            raise IllegalMessageSequence(ims_msg)
-        else:
-            await current_run.unmonitor(msg)
-        await self._reset_checkpoint_state_coro()
-
-    async def _save(self, msg):
-        """Save the event that is currently being bundled
-
-        Expected message object is:
-
-            Msg('save')
-        """
-        run_key = msg.run
-        if (
-            current_run := self._single_run_executor.run_bundlers.get(run_key, key_absence_sentinel := object())
-        ) is key_absence_sentinel:
-            # sanity check -- this should be caught by 'create' which makes
-            # this code path impossible
-            ims_msg = "A 'save' message was sent but no run is open."
-            raise IllegalMessageSequence(ims_msg)
-        else:
-            await current_run.save(msg)
-
-    async def _drop(self, msg):
-        """Drop the event that is currently being bundled
-
-        Expected message object is:
-
-            Msg('drop')
-        """
-        run_key = msg.run
-        if (
-            current_run := self._single_run_executor.run_bundlers.get(run_key, key_absence_sentinel := object())
-        ) is key_absence_sentinel:
-            ims_msg = "A 'drop' message was sent but no run is open."
-            raise IllegalMessageSequence(ims_msg)
-        else:
-            await current_run.drop(msg)
-
-    async def _prepare(self, msg):
-        """Prepare a flyer for a flyscan
-
-        Expected message object is:
-
-        If `flyer_object` obeys the Preparable protocol, it should have a .prepare
-        method that takes an argument to be set:
-
-            Msg('prepare', flyer_object, value)
-
-        Where value represents an initial state to move the flyer to.
-        """
-        obj = check_supports(msg.obj, Preparable)
-        kwargs = dict(msg.kwargs)
-        group = kwargs.pop("group", None)
-        ret = obj.prepare(*msg.args, **kwargs)
-
-        self._add_status_to_group(obj=obj, status_object=ret, group=group, action="prepare")
-
-        return ret
-
-    async def _kickoff(self, msg):
-        """Start a flyscan object
-
-        Special kwargs for the 'Msg' object in this function:
-        group : str
-            The blocking group to this flyer to
-
-        Expected message object is:
-
-        If `flyer_object` has a `kickoff` function that takes no arguments:
-
-            Msg('kickoff', flyer_object)
-            Msg('kickoff', flyer_object, group=<name>)
-
-        If `flyer_object` has a `kickoff` function that takes
-        `(start, stop, steps)` as its function arguments:
-
-            Msg('kickoff', flyer_object, start, stop, step)
-            Msg('kickoff', flyer_object, start, stop, step, group=<name>)
-        """
-        run_key = msg.run
-        if (
-            current_run := self._single_run_executor.run_bundlers.get(run_key, key_absence_sentinel := object())
-        ) is key_absence_sentinel:
-            ims_msg = "A 'kickoff' message was sent but no run is open."
-            raise IllegalMessageSequence(ims_msg)
-
-        _, obj, args, kwargs, _ = msg
-        obj = check_supports(obj, Flyable)
-        kwargs = dict(msg.kwargs)
-        group = kwargs.pop("group", None)
-        warn_if_msg_args_or_kwargs(msg, obj.kickoff, msg.args, kwargs)
-        ret = obj.kickoff(*msg.args, **kwargs)
-        await current_run.kickoff(msg)
-
-        self._add_status_to_group(obj=obj, status_object=ret, group=group, action="kickoff")
-
-        return ret
-
-    @tracer.start_as_current_span(f"{_SPAN_NAME_PREFIX} complete")
-    async def _complete(self, msg):
-        """
-        Tell a flyer, 'stop collecting, whenever you are ready'.
-
-        The flyer returns a status object. Some flyers respond to this
-        command by stopping collection and returning a finished status
-        object immediately. Other flyers finish their given course and
-        finish whenever they finish, irrespective of when this command is
-        issued.
-
-        Expected message object is:
-
-            Msg('complete', flyer, group=<GROUP>)
-
-        where <GROUP> is a hashable identifier.
-        """
-        _set_span_msg_attributes(trace.get_current_span(), msg)
-        kwargs = dict(msg.kwargs)
-        group = kwargs.pop("group", None)
-        obj = check_supports(msg.obj, Flyable)
-        warn_if_msg_args_or_kwargs(msg, obj.complete, msg.args, kwargs)
-        ret = obj.complete(*msg.args, **kwargs)
-
-        self._add_status_to_group(obj=obj, status_object=ret, group=group, action="complete")
-
-        return ret
-
-    @tracer.start_as_current_span(f"{_SPAN_NAME_PREFIX} collect")
-    async def _collect(self, msg):
-        """
-        Collect data cached by a flyer and emit documents
-
-        Expected message object is:
-
-            Msg('collect', flyer_object)
-            Msg('collect', flyer_object, stream=True, return_payload=False, name="a_name")
-        """
-        _set_span_msg_attributes(trace.get_current_span(), msg)
-        run_key = msg.run
-        if (
-            current_run := self._single_run_executor.run_bundlers.get(run_key, key_absence_sentinel := object())
-        ) is key_absence_sentinel:
-            # TODO add test exercising this path
-            ims_msg = "A 'collect' message was sent but no run is open."
-            raise IllegalMessageSequence(ims_msg)
-
-        return await current_run.collect(msg)
-
-    async def _null(self, msg):
-        """
-        A no-op message, mainly for debugging and testing.
-        """
-        pass
-
-    async def _RE_class(self, msg):
-        """
-        A no-op message, mainly for debugging and testing.
-        """
-        return type(self)
-
-    @tracer.start_as_current_span(f"{_SPAN_NAME_PREFIX} set")
-    async def _set(self, msg):
-        """
-        Set a device and cache the returned status object.
-
-        Also, note that the device has been touched so it can be stopped upon
-        exit.
-
-        Expected message object is
-
-            Msg('set', obj, *args, **kwargs)
-
-        where arguments are passed through to `obj.set(*args, **kwargs)`.
-        """
-        _set_span_msg_attributes(trace.get_current_span(), msg)
-        obj = check_supports(msg.obj, Movable)
-        kwargs = dict(msg.kwargs)
-        group = kwargs.pop("group", None)
-        self._single_run_executor.movable_objs_touched.add(obj)
-        ret = obj.set(*msg.args, **kwargs)
-
-        self._add_status_to_group(obj=obj, status_object=ret, group=group, action="set")
-
-        return ret
-
-    async def _trigger(self, msg):
-        """
-        Trigger a device and cache the returned status object.
-
-        Expected message object is:
-
-            Msg('trigger', obj)
-        """
-        obj = check_supports(msg.obj, Triggerable)
-        kwargs = dict(msg.kwargs)
-        group = kwargs.pop("group", None)
-        warn_if_msg_args_or_kwargs(msg, obj.trigger, msg.args, kwargs)
-        ret = obj.trigger(*msg.args, **kwargs)
-
-        self._add_status_to_group(obj=obj, status_object=ret, group=group, action="trigger")
-
-        return ret
-
-    def _call_waiting_hook(self, *args, **kwargs):
-        if self.waiting_hook is not None:
-            self.waiting_hook(*args, **kwargs)
-
-    @tracer.start_as_current_span(f"{_SPAN_NAME_PREFIX} wait")
-    async def _wait(self, msg: Msg) -> bool:
-        """Block progress until every object that was triggered or set
-        with the keyword argument `group=<GROUP>` is done. Returns a boolean that is
-        true when all triggered objects are done. When the keyword argument
-        `error_on_timeout=<error_on_timeout>` is false, this method can return before all objects are done
-        after a flush period given by the `timeout=<TIMEOUT>` keyword argument.
-
-        Expected message object is:
-
-            Msg('wait', group=<GROUP>, error_on_timeout=<ERROR_ON_TIMEOUT>)
-
-        where ``<GROUP>`` is any hashable key and ``<ERROR_ON_TIMEOUT>`` is a boolean.
-        """
-        _set_span_msg_attributes(trace.get_current_span(), msg)
-        done = False  # boolean that tracks whether waiting is complete
-        if msg.args:
-            (group,) = msg.args
-        else:
-            group = msg.kwargs["group"]
-        error_on_timeout = msg.kwargs.get("error_on_timeout", True)
-        watch = msg.kwargs.get("watch", ())
-        watch_task: asyncio.Task | None = None
-        if group:
-            trace.get_current_span().set_attribute("group", group)
-        else:
-            trace.get_current_span().set_attribute("no_group_given", True)
-        futs = self._groups.pop(group, set())
-        if futs:
-            status_objs = self._status_objs.pop(group)
-            try:
-                if not error_on_timeout:
-                    if group not in self._seen_wait_and_move_on_keys:
-                        self._seen_wait_and_move_on_keys.add(group)
-                        self._call_waiting_hook(status_objs)
-                else:  # if error_on_timeout False
-                    # Notify the waiting_hook function that the RunEngine is
-                    # waiting for these status_objs to complete. Users can use
-                    # the information these encapsulate to create a progress
-                    # bar.
-                    self._call_waiting_hook(status_objs)
-
-                async def wait_for_first_exception(futures: set) -> list[asyncio.Future]:
-                    return await self._wait_for(
-                        Msg(
-                            "wait_for",
-                            None,
-                            futures,
-                            return_when=asyncio.FIRST_EXCEPTION,
-                            timeout=msg.kwargs.get("timeout", None),
-                        )
-                    )
-
-                # Create the task waiting for the given group of statuses to complete
-                # or one of them to fail
-                status_task = asyncio.create_task(wait_for_first_exception(futs))
-                if watch:
-                    # Create a task that waits for an exception on any watch group
-                    # so we know whether to stop the wait early because of a watcher failure
-                    watch_futs = set()
-                    for w in watch:
-                        watch_futs.update(self._groups.get(w, set()))
-                    watch_task = asyncio.create_task(wait_for_first_exception(watch_futs))
-
-                    def cancel_status_task_if_error(fut: asyncio.Future[list[asyncio.Future]]):
-                        # If _wait_for raised an exception, or if any of the status
-                        # objects in the watch groups failed, cancel the status_task.
-                        if fut.exception() or any(f.exception() for f in fut.result()):
-                            status_task.cancel()
-
-                    watch_task.add_done_callback(cancel_status_task_if_error)
-                await status_task
-            except WaitForTimeoutError:
-                # We might wait to call wait again, so put the futures and status objects back in
-                self._groups[group] = futs
-                self._status_objs[group] = status_objs
-                if error_on_timeout:
-                    raise
-            finally:
-                if watch_task:
-                    watch_task.cancel()
-                if error_on_timeout:
-                    # Notify the waiting_hook function that we have moved on by
-                    # sending it `None`. If all goes well, it could have
-                    # inferred this from the status_obj, but there are edge
-                    # cases.
-                    self._call_waiting_hook(None)
-                    done = True
-                else:
-                    done = all(obj.done for obj in status_objs)
-                    if done:
-                        self._call_waiting_hook(None)
-                        self._seen_wait_and_move_on_keys.remove(group)
-        else:
-            done = True
-        return done
-
-    def _status_object_completed(self, ret, fut: asyncio.Future, pardon_failures):
-        """
-        Task to run when a status object is finished.
-
-        Parameters
-        ----------
-        ret : status object
-        p_event : asyncio.Event
-            held in the RunEngine's self._groups cache for waiting
-        pardon_failuers : asyncio.Event
-            tells us whether the __call__ this status object is over
-        """
-        if not ret.success and not pardon_failures.is_set():
-            # TODO: need a better channel to move this information back
-            # to the run task.
-            with self._single_run_executor.state_lock:
-                try:
-                    exc = ret.exception(timeout=0)
-                    raise FailedStatus(ret) from exc
-                except Exception as e:
-                    self._single_run_executor.exception = e
-                    fut.set_exception(e)
-                    # We have set the exception, but we don't mind if
-                    # no-one collects it from the future, so fetch it ourselves to
-                    # squash "Future exception was never retrieved" at teardown.
-                    fut.exception()
-        else:
-            fut.set_result(None)
-
-    async def _sleep(self, msg):
-        """
-        Sleep the event loop.
-
-        Expected message object is:
-
-            Msg('sleep', None, sleep_time)
-
-        where `sleep_time` is in seconds
-        """
-        await asyncio.sleep(*msg.args, **self._single_run_executor.loop_for_kwargs)
-
-    async def _pause(self, msg):
-        """Request the run engine to pause
-
-        Expected message object is:
-
-            Msg('pause', defer=False, name=None, callback=None)
-
-        See RunEngine.request_pause() docstring for explanation of the three
-        keyword arguments in the `Msg` signature
-        """
-        await self._request_pause_coro(*msg.args, **msg.kwargs)
-
-    async def _resume(self, msg):
-        """Request the run engine to resume
-
-        Expected message object is:
-
-            Msg('resume', defer=False, name=None, callback=None)
-
-        See RunEngine.resume() docstring for explanation of the three
-        keyword arguments in the `Msg` signature
-        """
-        # Re-instate monitoring callbacks.
-        for current_run in self._single_run_executor.run_bundlers.values():
-            await current_run.restore_monitors()
-        # Notify Devices of the resume in case they want to clean up.
-        for obj in self._single_run_executor.objs_seen:
-            if isinstance(obj, Pausable):
-                await maybe_await(obj.resume())
-
-    async def _checkpoint(self, msg):
-        """Instruct the RunEngine to create a checkpoint so that we can rewind
-        to this point if necessary
-
-        Expected message object is:
-
-            Msg('checkpoint')
-        """
-        for current_run in self._single_run_executor.run_bundlers.values():
-            if current_run.bundling:
-                raise IllegalMessageSequence("Cannot 'checkpoint' after 'create' and before 'save'. Aborting!")
-
-        await self._reset_checkpoint_state_coro()
-
-        if self._deferred_pause_requested:
-            # We are at a checkpoint; we are done deferring the pause.
-            # Give the _check_for_signals coroutine time to look for
-            # additional SIGINTs that would trigger an abort.
-            await asyncio.sleep(0.5, **self._single_run_executor.loop_for_kwargs)
-            await self._request_pause_coro(defer=False)
-
-    def _reset_checkpoint_state(self):
-        self._reset_checkpoint_state_meth()
-
-    def _reset_checkpoint_state_meth(self):
-        if self._single_run_executor.msg_cache is None:
-            return
-
-        self._single_run_executor.msg_cache = deque()
-        for current_run in self._single_run_executor.run_bundlers.values():
-            current_run.reset_checkpoint_state()
-
-    async def _reset_checkpoint_state_coro(self):
-        self._reset_checkpoint_state()
-
-    async def _clear_checkpoint(self, msg):
-        """Clear a set checkpoint
-
-        Expected message object is:
-
-            Msg('clear_checkpoint')
-        """
-        # clear message cache
-        self._single_run_executor.msg_cache = None
-        # clear stashed
-        for current_run in self._single_run_executor.run_bundlers.values():
-            await current_run.clear_checkpoint(msg)
-
-    async def _rewindable(self, msg):
-        """Set rewindable state of RunEngine
-
-        Expected message object is:
-
-            Msg('rewindable', None, bool or None)
-        """
-
-        (rw_flag,) = msg.args
-        if rw_flag is not None:
-            self.rewindable = rw_flag
-
-        return self.rewindable
-
-    async def _configure(self, msg):
-        """Configure an object
-
-        Expected message object is:
-
-            Msg('configure', object, *args, **kwargs)
-
-        which results in this call:
-
-            object.configure(*args, **kwargs)
-        """
-        run_key = msg.run
-        if (
-            current_run := self._single_run_executor.run_bundlers.get(run_key, key_absence_sentinel := object())
-        ) is key_absence_sentinel:
-            current_run = None
-        elif current_run.bundling:
-            ims_msg = "Cannot configure after 'create' but before 'save' Aborting!"
-            raise IllegalMessageSequence(ims_msg)
-        _, obj, args, kwargs, _ = msg
-
-        old, new = obj.configure(*args, **kwargs)
-        if current_run:
-            await current_run.configure(msg)
-        return old, new
-
-    def _add_status_to_group(self, obj: typing.Any, status_object: Status, group: str, action: str) -> None:
-        fut = self.loop.create_future()
-        pardon_failures = self._sinle_run_executor.pardon_failures
-
-        def done_callback(status: Status):
-            self.log.debug("The object %r reports %r is done with status %r.", obj, action, status_object.success)
-            self.loop.call_soon_threadsafe(self._status_object_completed, status_object, fut, pardon_failures)
-
-        try:
-            status_object.add_callback(done_callback)
-        except AttributeError:
-            # for ophyd < v0.8.0
-            status_object.finished_cb = done_callback  # type: ignore
-
-        self._groups[group].add(lambda: fut)
-        self._status_objs[group].add(status_object)
-
-    async def _stage(self, msg):
-        """Instruct the RunEngine to stage the object
-
-        Expected message object is:
-
-            Msg('stage', object)
-        """
-        _, obj, args, kwargs, _ = msg
-        # If an object has no 'stage' method, assume there is nothing to do.
-        if not isinstance(obj, Stageable):
-            return []
-        group = kwargs.pop("group", None)
-        ret = obj.stage()
-        self._single_run_executor.staged.add(obj)  # add first in case of failure below
-        await self._reset_checkpoint_state_coro()
-
-        if not isinstance(ret, Status):
-            return ret
-
-        self._add_status_to_group(obj=obj, status_object=ret, group=group, action="stage")
-
-        return ret
-
-    async def _unstage(self, msg):
-        """Instruct the RunEngine to unstage the object
-
-        Expected message object is:
-
-            Msg('unstage', object)
-        """
-        _, obj, args, kwargs, _ = msg
-        # If an object has no 'unstage' method, assume there is nothing to do.
-        if not isinstance(obj, Stageable):
-            return []
-        group = kwargs.pop("group", None)
-        ret = obj.unstage()
-        # use `discard()` to ignore objects that are not in the staged set.
-        self._single_run_executor.staged.discard(obj)
-        await self._reset_checkpoint_state_coro()
-
-        if not isinstance(ret, Status):
-            return ret
-
-        self._add_status_to_group(obj=obj, status_object=ret, group=group, action="unstage")
-
-        return ret
-
-    async def _stop(self, msg):
-        """
-        Stop a device.
-
-        Expected message object is:
-
-            Msg('stop', obj)
-        """
-        obj = check_supports(msg.obj, Stoppable)
-        return await maybe_await(obj.stop())  # nominally, this returns None
-
-    async def _subscribe(self, msg):
-        """
-        Add a subscription after the run has started.
-
-        This, like subscriptions passed to __call__, will be removed at the
-        end by the RunEngine.
-
-        Expected message object is:
-
-            Msg('subscribe', None, callback_function, document_name)
-
-        where `document_name` is one of:
-
-            {'start', 'descriptor', 'event', 'stop', 'all'}
-
-        and `callback_function` is expected to have a signature of:
-
-            ``f(name, document)``
-
-            where name is one of the ``document_name`` options and ``document``
-            is one of the document dictionaries in the event model.
-
-        See the docstring of bluesky.run_engine.Dispatcher.subscribe() for more
-        information.
-        """
-        self.log.debug("Adding subscription %r", msg)
-        _, obj, args, kwargs, _ = msg
-        token = self.subscribe(*args, **kwargs)
-        self._temp_callback_ids.add(token)
-        await self._reset_checkpoint_state_coro()
-        return token
-
-    async def _unsubscribe(self, msg):
-        """
-        Remove a subscription during a call -- useful for a multi-run call
-        where subscriptions are wanted for some runs but not others.
-
-        Expected message object is:
-
-            Msg('unsubscribe', None, TOKEN)
-            Msg('unsubscribe', token=TOKEN)
-
-        where ``TOKEN`` is the return value from ``RunEngine._subscribe()``
-        """
-        self.log.debug("Removing subscription %r", msg)
-        _, obj, arg, kwargs, _ = msg
-        if (token := kwargs.get("token", key_absence_sentinel := object())) is key_absence_sentinel:
-            (token,) = arg
-        self.unsubscribe(token)
-        self._temp_callback_ids.remove(token)
-        await self._reset_checkpoint_state_coro()
-
-    async def _input(self, msg):
-        """
-        Process a 'input' Msg. Expected Msg:
-
-            Msg('input', None)
-            Msg('input', None, prompt='>')  # customize prompt
-        """
-        prompt = msg.kwargs.get("prompt", "")
-        async_input = AsyncInput(self.loop)
-        async_input = functools.partial(async_input, end="", flush=True)
-        return await async_input(prompt)
-
-    def emit_sync(self, name, doc):
-        "Process blocking callbacks and schedule non-blocking callbacks."
-
-        # Process the doc, already validated against the schema in event-model
-        self.dispatcher.process(name, doc)
-
-    async def emit(self, name, doc):
-        self.emit_sync(name, doc)
 
 
 class Dispatcher:
