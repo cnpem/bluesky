@@ -281,6 +281,7 @@ class SingleRunExecutor:
         self.pardon_failures = None  # will hold an asyncio.Event
         self.exception = None  # stored and then raised in the _run loop
         self._rewindable_flag: bool = True  # if the RE is allowed to replay msgs
+        self.record_interruptions = False
         self.plan = None  # the plan instance from __call__
 
         self.staged: set[typing.Any] = set()  # objects staged, not yet unstaged
@@ -1921,7 +1922,6 @@ class RunEngine:
 
         self.max_depth = None
         self.waiting_hook = None
-        self.record_interruptions = False
         self.pause_msg = PAUSE_MSG
         self.NO_PLAN_RETURN = object()
 
@@ -2103,6 +2103,14 @@ class RunEngine:
     @md_normalizer.setter
     def md_normalizer(self, v):
         self._single_run_executor.md_normalizer = v
+
+    @property
+    def record_interruptions(self):
+        return self._single_run_executor.record_interruptions
+
+    @record_interruptions.setter
+    def record_interruptions(self, v):
+        self._single_run_executor.record_interruptions = v
 
     @property
     def rewindable(self):
