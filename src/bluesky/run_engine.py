@@ -214,6 +214,8 @@ def _state_locked(func):
 
 class SingleRunExecutor:
 
+    RunBundler = RunBundler
+
     _UNCACHEABLE_COMMANDS = [
         "pause",
         "subscribe",
@@ -1833,8 +1835,6 @@ class RunEngine:
         The list of commands available to Msg.
 
     """
-
-    RunBundler = RunBundler
 
     @property
     def log(self):
