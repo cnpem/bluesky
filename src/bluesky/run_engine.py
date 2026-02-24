@@ -282,6 +282,7 @@ class SingleRunExecutor:
         self.exception = None  # stored and then raised in the _run loop
         self._rewindable_flag: bool = True  # if the RE is allowed to replay msgs
         self.record_interruptions = False
+        self._require_stream_declaration = False
         self.plan = None  # the plan instance from __call__
 
         self.staged: set[typing.Any] = set()  # objects staged, not yet unstaged
@@ -1950,7 +1951,6 @@ class RunEngine:
         self._reason = ""  # reason for abort
         self._task = None  # asyncio.Task associated with call to self._run
         self._task_fut = None  # future proxy to the task above
-        self._require_stream_declaration = False
 
         # public dispatcher for callbacks
         # The Dispatcher's public methods are exposed through the
