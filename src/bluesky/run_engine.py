@@ -244,7 +244,8 @@ class SingleRunExecutor:
             md: dict | None = None,
             loop: asyncio.AbstractEventLoop | None = None,  
             scan_id_source: typing.Callable[[dict], SyncOrAsync[int]] = default_scan_id_source,
-            md_validator: typing.Callable | None = None
+            md_validator: typing.Callable | None = None,
+            md_normalizer: typing.Callable | None = None,
         ):
         if loop is None:
             loop = asyncio.new_event_loop()
@@ -255,6 +256,10 @@ class SingleRunExecutor:
         if md_validator is None:
             md_validator = _default_md_validator
         self.md_validator = md_validator
+
+        if md_normalizer is None:
+            md_normalizer = _default_md_normalizer
+        self.md_normalizer = md_normalizer
     
         if md is None:
             md = {}
@@ -1869,7 +1874,10 @@ class RunEngine:
         call_returns_result: bool = False,
     ):
         self._single_run_executor = SingleRunExecutor(
-            md, loop, scan_id_source, md_validator)
+            md=md, loop=loop, 
+            scan_id_source=scan_id_source, 
+            md_validator=md_validator,
+            md_normalizer=md_normalizer)
         # When set, RunEngine.__call__ should stop blocking.
         self._blocking_event = threading.Event()
 
@@ -1910,9 +1918,6 @@ class RunEngine:
         if context_managers is None:
             context_managers = [SigintHandler]
         self.context_managers = context_managers
-        if md_normalizer is None:
-            md_normalizer = _default_md_normalizer
-        self.md_normalizer = md_normalizer
 
         self.max_depth = None
         self.waiting_hook = None
@@ -2090,6 +2095,14 @@ class RunEngine:
     @md_validator.setter
     def md_validator(self, v):
         self._single_run_executor.md_validator = v
+
+    @property
+    def md_normalizer(self):
+        return self._single_run_executor.md_normalizer
+
+    @md_normalizer.setter
+    def md_normalizer(self, v):
+        self._single_run_executor.md_normalizer = v
 
     @property
     def rewindable(self):
