@@ -302,6 +302,17 @@ class SingleRunExecutor:
         # Python id, to keep from mixing output from separate instances.
         self.log = ComposableLogAdapter(logger, {"RE": self})
         
+        # public dispatcher for callbacks
+        # The Dispatcher's public methods are exposed through the
+        # RunEngine for user convenience.
+        self.dispatcher = Dispatcher()
+        
+        # aliases for back-compatibility
+        self.subscribe_lossless = self.dispatcher.subscribe
+        self.unsubscribe_lossless = self.dispatcher.unsubscribe
+        self._subscribe_lossless = self.dispatcher.subscribe
+        self._unsubscribe_lossless = self.dispatcher.unsubscribe
+
         self.command_registry = {
             "declare_stream": self._declare_stream,
             "create": self._create,
@@ -1952,17 +1963,9 @@ class RunEngine:
         self._task = None  # asyncio.Task associated with call to self._run
         self._task_fut = None  # future proxy to the task above
 
-        # public dispatcher for callbacks
-        # The Dispatcher's public methods are exposed through the
-        # RunEngine for user convenience.
-        self.dispatcher = Dispatcher()
         self.ignore_callback_exceptions = False
-
-        # aliases for back-compatibility
-        self.subscribe_lossless = self.dispatcher.subscribe
-        self.unsubscribe_lossless = self.dispatcher.unsubscribe
-        self._subscribe_lossless = self.dispatcher.subscribe
-        self._unsubscribe_lossless = self.dispatcher.unsubscribe
+        self.subscribe_lossless = self._single_run_executor.dispatcher.subscribe
+        self.unsubscribe_lossless = self._single_run_executor.dispatcher.unsubscribe
 
     @property
     def msg_hook(self):
@@ -2061,7 +2064,7 @@ class RunEngine:
         """
         # pass through to the Dispatcher, spelled out verbosely here to make
         # sphinx happy -- tricks with __doc__ aren't enough to fool it
-        return self.dispatcher.subscribe(func, name)
+        return self._single_run_executor.dispatcher.subscribe(func, name)
 
     def unsubscribe(self, token):
         """
@@ -2078,7 +2081,7 @@ class RunEngine:
         """
         # pass through to the Dispatcher, spelled out verbosely here to make
         # sphinx happy -- tricks with __doc__ aren't enough to fool it
-        return self.dispatcher.unsubscribe(token)
+        return self._single_run_executor.dispatcher.unsubscribe(token)
 
     @property
     def md(self):
@@ -2183,7 +2186,7 @@ class RunEngine:
             self.halt()
         self._clear_run_cache()
         self._clear_call_cache()
-        self.dispatcher.unsubscribe_all()
+        self._single_run_executor.dispatcher.unsubscribe_all()
 
     @property
     def resumable(self):
@@ -2192,11 +2195,11 @@ class RunEngine:
 
     @property
     def ignore_callback_exceptions(self):
-        return self.dispatcher.ignore_exceptions
+        return self._single_run_executor.dispatcher.ignore_exceptions
 
     @ignore_callback_exceptions.setter
     def ignore_callback_exceptions(self, val):
-        self.dispatcher.ignore_exceptions = val
+        self._single_run_executor.dispatcher.ignore_exceptions = val
 
     def register_command(self, name, func):
         """
