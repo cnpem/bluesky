@@ -283,6 +283,7 @@ class SingleRunExecutor:
         self._rewindable_flag: bool = True  # if the RE is allowed to replay msgs
         self.record_interruptions = False
         self._require_stream_declaration = False
+        self.deferred_pause_requested = False  # pause at next 'checkpoint'
         self.plan = None  # the plan instance from __call__
         self.exit_status = "success"  # optimistic default
 
@@ -1355,7 +1356,7 @@ class SingleRunExecutor:
 
         await self._reset_checkpoint_state_coro()
 
-        if self._deferred_pause_requested:
+        if self.deferred_pause_requested:
             # We are at a checkpoint; we are done deferring the pause.
             # Give the _check_for_signals coroutine time to look for
             # additional SIGINTs that would trigger an abort.
@@ -1873,7 +1874,7 @@ class RunEngine:
         boolean
             Indicates if deferred pause was requested, but not processed.
         """
-        return self._deferred_pause_requested
+        return self._single_run_executor.deferred_pause_requested
 
     def __init__(
         self,
@@ -1946,7 +1947,6 @@ class RunEngine:
         # The RunEngine keeps track of a *lot* of state.
         # All flags and caches are defined here with a comment. Good luck.
         self._call_returns_result = call_returns_result  # should __call__ return UIDs or plan value
-        self._deferred_pause_requested = False  # pause at next 'checkpoint'
         self._interrupted = False  # True if paused, aborted, or failed
         self._suspenders: set[typing.Any] = set()  # set holding suspenders
         self._groups: defaultdict[str, set[Callable[[], asyncio.Future]]] = defaultdict(
@@ -2157,7 +2157,7 @@ class RunEngine:
         self._single_run_executor.staged.clear()
         self._single_run_executor.objs_seen.clear()
         self._single_run_executor.movable_objs_touched.clear()
-        self._deferred_pause_requested = False
+        self._single_run_executor.deferred_pause_requested = False
         self._single_run_executor.plan_stack = deque()
         self._single_run_executor.msg_cache = deque()
         self._single_run_executor.response_stack = deque()
@@ -2265,13 +2265,13 @@ class RunEngine:
             raise TransitionError(f"Run Engine is in '{self.state}' state and can not be paused.")
 
         if defer:
-            self._deferred_pause_requested = True
+            self._single_run_executor.deferred_pause_requested = True
             print("Deferred pause acknowledged. Continuing to checkpoint.")
             return
 
         print("Pausing...")
 
-        self._deferred_pause_requested = False
+        self._single_run_executor.deferred_pause_requested = False
         self._interrupted = True
         self.state = "pausing"
         for current_run in self._single_run_executor.run_bundlers.values():
