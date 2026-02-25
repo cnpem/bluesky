@@ -1712,6 +1712,26 @@ class SingleRunExecutor:
         self._groups.clear()
         self._status_objs.clear()
 
+    async def _request_pause_coro(self, defer=False):
+        # We are pausing. Cancel any deferred pause previously requested.
+        if not self._state.can_pause:
+            raise TransitionError(f"Run Engine is in '{self._state}' state and can not be paused.")
+
+        if defer:
+            self.deferred_pause_requested = True
+            print("Deferred pause acknowledged. Continuing to checkpoint.")
+            return
+
+        print("Pausing...")
+
+        self.deferred_pause_requested = False
+        self.interrupted = True
+        self._state = "pausing"
+        for current_run in self.run_bundlers.values():
+            current_run.record_interruption("pause")
+
+        self.task.cancel()
+
 
 class RunEngine:
     """The Run Engine execute messages and emits Documents.
@@ -2268,29 +2288,9 @@ class RunEngine:
         """
         if self.state == "panicked":
             raise RuntimeError("The RunEngine is panicked and cannot be recovered. You must restart bluesky.")
-        future = asyncio.run_coroutine_threadsafe(self._request_pause_coro(defer), loop=self.loop)
+        future = asyncio.run_coroutine_threadsafe(self._single_run_executor.request_pause_coro(defer), loop=self.loop)
         # TODO add a timeout here?
         return future.result()
-
-    async def _request_pause_coro(self, defer=False):
-        # We are pausing. Cancel any deferred pause previously requested.
-        if not self.state.can_pause:
-            raise TransitionError(f"Run Engine is in '{self.state}' state and can not be paused.")
-
-        if defer:
-            self._single_run_executor.deferred_pause_requested = True
-            print("Deferred pause acknowledged. Continuing to checkpoint.")
-            return
-
-        print("Pausing...")
-
-        self._single_run_executor.deferred_pause_requested = False
-        self._single_run_executor.interrupted = True
-        self.state = "pausing"
-        for current_run in self._single_run_executor.run_bundlers.values():
-            current_run.record_interruption("pause")
-
-        self._single_run_executor.task.cancel()
 
     def _create_result(self, plan_return):
         """
