@@ -2108,6 +2108,10 @@ class RunEngine:
         return self._single_run_executor.dispatcher.unsubscribe(token)
 
     @property
+    def interrupted(self):
+        return self._single_run_executor.interrupted
+
+    @property
     def md(self):
         return self._single_run_executor.md
 

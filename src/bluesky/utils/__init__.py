@@ -280,7 +280,7 @@ class SigintHandler(SignalHandler):
         # Check for pause requests from keyboard.
         # TODO, there is a possible race condition between the two
         # pauses here
-        if self.RE.state.is_running and (not self.RE._interrupted):
+        if self.RE.state.is_running and (not self.RE.interrupted):
             if self.last_sigint_time is None or time.time() - self.last_sigint_time > 10:
                 # reset the counter to 1
                 # It's been 10 seconds since the last SIGINT. Reset.
