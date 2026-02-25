@@ -2536,7 +2536,7 @@ class RunEngine:
                     # before giving up and putting the RE in a
                     # non-recoverable panicked state.
                     if not task_finished or num_threads != 1:
-                        self.state = "panicked"
+                        self._single_run_executor.state = "panicked"
                 except Exception as raised_er:
                     self.halt()
                     self._single_run_executor.interrupted = True
@@ -2614,7 +2614,7 @@ class RunEngine:
                 with self._single_run_executor.state_lock:
                     self._single_run_executor.exception = FailedPause()
                 was_paused = self.state == "paused"
-                self.state = "aborting"
+                self._single_run_executor.state = "aborting"
                 if not was_paused:
                     self._single_run_executor.task.cancel()
             if justification is not None:
@@ -2630,7 +2630,7 @@ class RunEngine:
             # and then the RunEngine will be hung up on processing the
             # 'wait_for' message until `fut` is set.
             if not self.state == "paused":
-                self.state = "suspending"
+                self._single_run_executor.state = "suspending"
                 # bump the _run task out of what ever it is awaiting
                 self._single_run_executor.task.cancel()
 
@@ -2666,7 +2666,7 @@ class RunEngine:
         self._destroy_open_run_tracing_spans()
 
         was_paused = self.state == "paused"
-        self.state = "aborting"
+        self._single_run_executor.state = "aborting"
         if was_paused:
             with self._single_run_executor.state_lock:
                 self._single_run_executor.exception = RequestAbort()
@@ -2706,7 +2706,7 @@ class RunEngine:
 
         self._single_run_executor.interrupted = True
         was_paused = self.state == "paused"
-        self.state = "stopping"
+        self._single_run_executor.state = "stopping"
         if was_paused:
             with self._single_run_executor.state_lock:
                 self._single_run_executor.exception = RequestStop
@@ -2770,7 +2770,7 @@ class RunEngine:
         self._destroy_open_run_tracing_spans()
         self._single_run_executor.interrupted = True
         was_paused = self.state == "paused"
-        self.state = "halting"
+        self._single_run_executor.state = "halting"
         if was_paused:
             with self._single_run_executor.state_lock:
                 self._single_run_executor.exception = PlanHalt
