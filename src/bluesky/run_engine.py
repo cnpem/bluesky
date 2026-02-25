@@ -407,7 +407,7 @@ class SingleRunExecutor:
         # that acts as a proxy that does not have the correct behavior
         # when `.cancel` is called on it.
         with self.state_lock:
-            self._task = current_task(self.loop)
+            self.task = current_task(self.loop)
         stashed_exception = None
         debug = msg_logger.debug
         self._reason = ""
