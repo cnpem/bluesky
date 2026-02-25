@@ -248,6 +248,7 @@ class SingleRunExecutor:
             scan_id_source: typing.Callable[[dict], SyncOrAsync[int]] = default_scan_id_source,
             md_validator: typing.Callable | None = None,
             md_normalizer: typing.Callable | None = None,
+            blocking_event: threading.Event | None = None
         ):
         if loop is None:
             loop = asyncio.new_event_loop()
@@ -273,6 +274,8 @@ class SingleRunExecutor:
             self.loop_for_kwargs = {"loop": self.loop}
         else:
             self.loop_for_kwargs: dict[str, asyncio.AbstractEventLoop] = {}
+
+        self._blocking_event = blocking_event
 
         # When cleared, RunEngine._run will pause until set.
         self.waiting_hook = None
@@ -1927,13 +1930,15 @@ class RunEngine:
         during_task: DuringTask | None = None,
         call_returns_result: bool = False,
     ):
+        # When set, RunEngine.__call__ should stop blocking.
+        self._blocking_event = threading.Event()
+        
         self._single_run_executor = SingleRunExecutor(
             md=md, loop=loop, 
             scan_id_source=scan_id_source, 
             md_validator=md_validator,
-            md_normalizer=md_normalizer)
-        # When set, RunEngine.__call__ should stop blocking.
-        self._blocking_event = threading.Event()
+            md_normalizer=md_normalizer,
+            blocking_event=self._blocking_event)
 
         setup_event = threading.Event()
 
