@@ -1431,7 +1431,7 @@ class SingleRunExecutor:
 
     def _add_status_to_group(self, obj: typing.Any, status_object: Status, group: str, action: str) -> None:
         fut = self.loop.create_future()
-        pardon_failures = self._sinle_run_executor.pardon_failures
+        pardon_failures = self.pardon_failures
 
         def done_callback(status: Status):
             self.log.debug("The object %r reports %r is done with status %r.", obj, action, status_object.success)
