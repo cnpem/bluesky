@@ -391,6 +391,11 @@ class SingleRunExecutor:
     def md(self, v):
         self._md.update(v)
 
+    @property
+    def resumable(self):
+        "i.e., can the plan in progress by rewound"
+        return self.msg_cache is not None
+    
     async def _run(self):
         """Pull messages from the plan, process them, send results back.
 
@@ -2228,7 +2233,7 @@ class RunEngine:
     @property
     def resumable(self):
         "i.e., can the plan in progress by rewound"
-        return self._single_run_executor.msg_cache is not None
+        return self._single_run_executor.resumable
 
     @property
     def ignore_callback_exceptions(self):
