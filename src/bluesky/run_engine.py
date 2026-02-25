@@ -1331,7 +1331,7 @@ class SingleRunExecutor:
         See RunEngine.request_pause() docstring for explanation of the three
         keyword arguments in the `Msg` signature
         """
-        await self._request_pause_coro(*msg.args, **msg.kwargs)
+        await self.request_pause_coro(*msg.args, **msg.kwargs)
 
     async def _resume(self, msg):
         """Request the run engine to resume
@@ -1370,7 +1370,7 @@ class SingleRunExecutor:
             # Give the _check_for_signals coroutine time to look for
             # additional SIGINTs that would trigger an abort.
             await asyncio.sleep(0.5, **self.loop_for_kwargs)
-            await self._request_pause_coro(defer=False)
+            await self.request_pause_coro(defer=False)
 
     def _reset_checkpoint_state(self):
         self._reset_checkpoint_state_meth()
@@ -1712,7 +1712,7 @@ class SingleRunExecutor:
         self._groups.clear()
         self._status_objs.clear()
 
-    async def _request_pause_coro(self, defer=False):
+    async def request_pause_coro(self, defer=False):
         # We are pausing. Cancel any deferred pause previously requested.
         if not self._state.can_pause:
             raise TransitionError(f"Run Engine is in '{self._state}' state and can not be paused.")
