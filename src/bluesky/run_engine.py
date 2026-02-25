@@ -275,6 +275,7 @@ class SingleRunExecutor:
             self.loop_for_kwargs: dict[str, asyncio.AbstractEventLoop] = {}
 
         # When cleared, RunEngine._run will pause until set.
+        self.waiting_hook = None
         self.run_permit = None
         self.msg_hook = None
         self.state_hook = None
@@ -1946,7 +1947,6 @@ class RunEngine:
         self.context_managers = context_managers
 
         self.max_depth = None
-        self.waiting_hook = None
         self.pause_msg = PAUSE_MSG
         self.NO_PLAN_RETURN = object()
 
@@ -2094,6 +2094,14 @@ class RunEngine:
     @md.setter
     def md(self, v):
         self._single_run_executor.md = v
+
+    @property
+    def waiting_hook(self):
+        return self._single_run_executor.waiting_hook
+
+    @waiting_hook.setter
+    def waiting_hook(self, v):
+        self._single_run_executor.waiting_hook = v
 
     @property
     def md_validator(self):
