@@ -305,6 +305,8 @@ class SingleRunExecutor:
         self._seen_wait_and_move_on_keys: set[typing.Any] = (
             set()
         )  # group ids that have been passed to _wait_and_move_on
+        self._suspenders: set[typing.Any] = set()  # set holding suspenders
+        self._temp_callback_ids: set[typing.Any] = set()  # ids from CallbackRegistry
 
         self.run_tracing_spans: list[Span] = []
 
@@ -1544,7 +1546,7 @@ class SingleRunExecutor:
         """
         self.log.debug("Adding subscription %r", msg)
         _, obj, args, kwargs, _ = msg
-        token = self.subscribe(*args, **kwargs)
+        token = self.dispatcher.subscribe(*args, **kwargs)
         self._temp_callback_ids.add(token)
         await self._reset_checkpoint_state_coro()
         return token
@@ -1565,7 +1567,7 @@ class SingleRunExecutor:
         _, obj, arg, kwargs, _ = msg
         if (token := kwargs.get("token", key_absence_sentinel := object())) is key_absence_sentinel:
             (token,) = arg
-        self.unsubscribe(token)
+        self.dispatcher.unsubscribe(token)
         self._temp_callback_ids.remove(token)
         await self._reset_checkpoint_state_coro()
 
@@ -1691,6 +1693,24 @@ class SingleRunExecutor:
         # add the above helper to the plan stack
         self.plan_stack.append(suspender_helper_inner_plan())
         self.response_stack.append(None)
+
+    def _rewind(self):
+        """Clean up in preparation for resuming from a pause or suspension.
+
+        Returns
+        -------
+        new_plan : generator
+             A new plan made from the messages in the message cache
+
+        """
+        len_msg_cache = len(self.msg_cache)
+        new_plan = ensure_generator(list(self.msg_cache))
+        self.msg_cache = deque()
+        if len_msg_cache:
+            for current_run in self.run_bundlers.values():
+                current_run.rewind()
+
+        return new_plan
 
     def emit_sync(self, name, doc):
         "Process blocking callbacks and schedule non-blocking callbacks."
@@ -1938,6 +1958,12 @@ class RunEngine:
             blocking_event=self._blocking_event,
         )
 
+        # TODO: for coherence with tests,
+        # these attributes are kept but they should be
+        # reworked at some point...
+        self._th = self._single_run_executor.th
+        self._loop = self._single_run_executor.loop
+
         setup_event = threading.Event()
 
         def setup_run_permit():
@@ -1987,18 +2013,22 @@ class RunEngine:
         # The RunEngine keeps track of a *lot* of state.
         # All flags and caches are defined here with a comment. Good luck.
         self._call_returns_result = call_returns_result  # should __call__ return UIDs or plan value
-        self._suspenders: set[typing.Any] = set()  # set holding suspenders
-        self._temp_callback_ids: set[typing.Any] = set()  # ids from CallbackRegistry
         self._reason = ""  # reason for abort
         self._task_fut = None  # future proxy to the task above
 
         self.ignore_callback_exceptions = False
         self.subscribe_lossless = self._single_run_executor.dispatcher.subscribe
         self.unsubscribe_lossless = self._single_run_executor.dispatcher.unsubscribe
+        self._subscribe_lossless = self._single_run_executor.dispatcher.subscribe
+        self._unsubscribe_lossless = self._single_run_executor.dispatcher.unsubscribe
 
     @property
     def msg_hook(self):
         return self._single_run_executor.msg_hook
+
+    @msg_hook.setter
+    def msg_hook(self, v):
+        self._single_run_executor.msg_hook = v
 
     @property
     def state_hook(self):
@@ -2170,7 +2200,7 @@ class RunEngine:
 
     @property
     def suspenders(self):
-        return tuple(self._suspenders)
+        return tuple(self._single_run_executor._suspenders)
 
     @property
     def verbose(self):
@@ -2214,9 +2244,9 @@ class RunEngine:
         self._single_run_executor.interrupted = False
 
         # Unsubscribe for per-run callbacks.
-        for cid in self._temp_callback_ids:
+        for cid in self._single_run_executor._temp_callback_ids:
             self.unsubscribe(cid)
-        self._temp_callback_ids.clear()
+        self._single_run_executor._temp_callback_ids.clear()
 
     def reset(self):
         """
@@ -2401,7 +2431,7 @@ class RunEngine:
 
         for name, funcs in normalize_subs_input(subs).items():
             for func in funcs:
-                self._temp_callback_ids.add(self.subscribe(func, name))
+                self._single_run_executor._temp_callback_ids.add(self.subscribe(func, name))
 
         self._single_run_executor.plan = plan  # this ref is just used for metadata introspection
         self._single_run_executor.metadata_per_call.update(metadata_kw)
@@ -2462,7 +2492,7 @@ class RunEngine:
         self._single_run_executor.interrupted = False
         for current_run in self._single_run_executor.run_bundlers.values():
             current_run.record_interruption("resume")
-        new_plan = self._rewind()
+        new_plan = self._single_run_executor._rewind()
         self._single_run_executor.plan_stack.append(new_plan)
         self._single_run_executor.response_stack.append(None)
         # Notify Devices of the resume in case they want to clean up.
@@ -2479,24 +2509,6 @@ class RunEngine:
             return run_engine_result
         else:
             return tuple(self._single_run_executor.run_start_uids)
-
-    def _rewind(self):
-        """Clean up in preparation for resuming from a pause or suspension.
-
-        Returns
-        -------
-        new_plan : generator
-             A new plan made from the messages in the message cache
-
-        """
-        len_msg_cache = len(self._single_run_executor.msg_cache)
-        new_plan = ensure_generator(list(self._single_run_executor.msg_cache))
-        self._single_run_executor.msg_cache = deque()
-        if len_msg_cache:
-            for current_run in self._single_run_executor.run_bundlers.values():
-                current_run.rewind()
-
-        return new_plan
 
     def _resume_task(self, *, init_func=None):
         # Clear the blocking Event so that we can wait on it below.
