@@ -1808,6 +1808,27 @@ class SingleRunExecutor:
         else:
             return tuple(self.run_start_uids)
 
+    async def _stop_coro(self):
+        if self.state.is_idle:
+            raise TransitionError("RunEngine is already idle.")
+        print("Stopping: running cleanup and marking exit_status as 'success'...")
+
+        self.interrupted = True
+        was_paused = self.state == "paused"
+        self.state = "stopping"
+        if was_paused:
+            with self.state_lock:
+                self.exception = RequestStop
+        else:
+            self.task.cancel()
+
+        if self._call_returns_result:
+            plan_return = NO_PLAN_RETURN
+            run_engine_result = self._create_result(plan_return)
+            return run_engine_result
+        else:
+            return tuple(self.run_start_uids)
+
     def _create_result(self, plan_return):
         """
         Create a RunEngineResult to return from __call__, using
@@ -2767,28 +2788,7 @@ class RunEngine:
         :meth:`RunEngine.abort`
         :meth:`RunEngine.halt`
         """
-        return self.__interrupter_helper(self._stop_coro())
-
-    async def _stop_coro(self):
-        if self.state.is_idle:
-            raise TransitionError("RunEngine is already idle.")
-        print("Stopping: running cleanup and marking exit_status as 'success'...")
-
-        self._single_run_executor.interrupted = True
-        was_paused = self.state == "paused"
-        self._single_run_executor.state = "stopping"
-        if was_paused:
-            with self._single_run_executor.state_lock:
-                self._single_run_executor.exception = RequestStop
-        else:
-            self._single_run_executor.task.cancel()
-
-        if self._call_returns_result:
-            plan_return = NO_PLAN_RETURN
-            run_engine_result = self._create_result(plan_return)
-            return run_engine_result
-        else:
-            return tuple(self._single_run_executor.run_start_uids)
+        return self.__interrupter_helper(self._single_run_executor._stop_coro())
 
     def halt(self):
         """
