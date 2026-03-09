@@ -213,7 +213,6 @@ def _state_locked(func):
 
 
 class SingleRunExecutor:
-
     RunBundler = RunBundler
 
     _UNCACHEABLE_COMMANDS = [
@@ -236,20 +235,20 @@ class SingleRunExecutor:
     @property
     def state(self):
         return self._state
-    
+
     @state.setter
     def state(self, value):
         self._state = value
 
     def __init__(
-            self,
-            md: dict | None = None,
-            loop: asyncio.AbstractEventLoop | None = None,  
-            scan_id_source: typing.Callable[[dict], SyncOrAsync[int]] = default_scan_id_source,
-            md_validator: typing.Callable | None = None,
-            md_normalizer: typing.Callable | None = None,
-            blocking_event: threading.Event | None = None
-        ):
+        self,
+        md: dict | None = None,
+        loop: asyncio.AbstractEventLoop | None = None,
+        scan_id_source: typing.Callable[[dict], SyncOrAsync[int]] = default_scan_id_source,
+        md_validator: typing.Callable | None = None,
+        md_normalizer: typing.Callable | None = None,
+        blocking_event: threading.Event | None = None,
+    ):
         if loop is None:
             loop = asyncio.new_event_loop()
         set_bluesky_event_loop(loop)
@@ -263,7 +262,7 @@ class SingleRunExecutor:
         if md_normalizer is None:
             md_normalizer = _default_md_normalizer
         self.md_normalizer = md_normalizer
-    
+
         if md is None:
             md = {}
         self._md = md
@@ -310,18 +309,18 @@ class SingleRunExecutor:
         )  # status objects to wait for
 
         self.run_tracing_spans: list[Span] = []
-        
+
         self.state_lock = threading.RLock()
 
         # Make a logger for this specific RE instance, using the instance's
         # Python id, to keep from mixing output from separate instances.
         self.log = ComposableLogAdapter(logger, {"RE": self})
-        
+
         # public dispatcher for callbacks
         # The Dispatcher's public methods are exposed through the
         # RunEngine for user convenience.
         self.dispatcher = Dispatcher()
-        
+
         # aliases for back-compatibility
         self.subscribe_lossless = self.dispatcher.subscribe
         self.unsubscribe_lossless = self.dispatcher.unsubscribe
@@ -398,7 +397,7 @@ class SingleRunExecutor:
     def resumable(self):
         "i.e., can the plan in progress by rewound"
         return self.msg_cache is not None
-    
+
     async def _run(self):
         """Pull messages from the plan, process them, send results back.
 
@@ -732,7 +731,6 @@ class SingleRunExecutor:
             raise stashed_exception
         return plan_return
 
-
     async def _wait_for(self, msg):
         """Instruct the RunEngine to wait for futures and return the resulting tasks.
 
@@ -824,9 +822,7 @@ class SingleRunExecutor:
         """
         # TODO extract this from the Msg
         run_key = msg.run
-        if (
-            current_run := self.run_bundlers.get(run_key, key_absence_sentinel := object)
-        ) is key_absence_sentinel:
+        if (current_run := self.run_bundlers.get(run_key, key_absence_sentinel := object)) is key_absence_sentinel:
             ims_msg = "A 'close_run' message was not received before the 'open_run' message"
             raise IllegalMessageSequence(ims_msg)
         ret = await current_run.close_run(msg)
@@ -1585,6 +1581,7 @@ class SingleRunExecutor:
         async_input = AsyncInput(self.loop)
         async_input = functools.partial(async_input, end="", flush=True)
         return await async_input(prompt)
+
     def install_suspender(self, suspender):
         """
         Install a 'suspender', which can suspend and resume execution.
@@ -1896,11 +1893,11 @@ class RunEngine:
     @property
     def log(self):
         return self._single_run_executor.log
-    
+
     @property
     def state(self):
         return self._single_run_executor.state
-    
+
     @property
     def deferred_pause_requested(self):
         """
@@ -1932,13 +1929,15 @@ class RunEngine:
     ):
         # When set, RunEngine.__call__ should stop blocking.
         self._blocking_event = threading.Event()
-        
+
         self._single_run_executor = SingleRunExecutor(
-            md=md, loop=loop, 
-            scan_id_source=scan_id_source, 
+            md=md,
+            loop=loop,
+            scan_id_source=scan_id_source,
             md_validator=md_validator,
             md_normalizer=md_normalizer,
-            blocking_event=self._blocking_event)
+            blocking_event=self._blocking_event,
+        )
 
         setup_event = threading.Event()
 
@@ -1970,7 +1969,7 @@ class RunEngine:
 
         self.md["versions"]["bluesky"] = __version__
         self.md["versions"]["event_model"] = event_model.__version__
-        
+
         if preprocessors is None:
             preprocessors = []
         self.preprocessors = preprocessors
@@ -2004,7 +2003,7 @@ class RunEngine:
     @property
     def msg_hook(self):
         return self._single_run_executor.msg_hook
-    
+
     @property
     def state_hook(self):
         return self._single_run_executor.state_hook
@@ -2302,7 +2301,9 @@ class RunEngine:
         """
         if self.state == "panicked":
             raise RuntimeError("The RunEngine is panicked and cannot be recovered. You must restart bluesky.")
-        future = asyncio.run_coroutine_threadsafe(self._single_run_executor.request_pause_coro(defer), loop=self.loop)
+        future = asyncio.run_coroutine_threadsafe(
+            self._single_run_executor.request_pause_coro(defer), loop=self.loop
+        )
         # TODO add a timeout here?
         return future.result()
 
