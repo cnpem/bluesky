@@ -2063,6 +2063,9 @@ class RunEngine:
         self._th = self._single_run_executor.th
         self._loop = self._single_run_executor.loop
         self._seen_wait_and_move_on_keys = self._single_run_executor._seen_wait_and_move_on_keys
+        self.dispatcher = self._single_run_executor.dispatcher
+        self._command_registry = self._single_run_executor.command_registry
+        self._run_bundlers = self._single_run_executor.run_bundlers
 
         setup_event = threading.Event()
 
