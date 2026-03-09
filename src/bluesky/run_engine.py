@@ -2131,6 +2131,10 @@ class RunEngine:
     def scan_id_source(self):
         return self._single_run_executor.scan_id_source
 
+    @scan_id_source.setter
+    def scan_id_source(self, v):
+        self._single_run_executor.scan_id_source = v
+
     @property
     def commands(self):
         """
