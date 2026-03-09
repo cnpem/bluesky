@@ -1783,6 +1783,31 @@ class SingleRunExecutor:
         else:
             return tuple(self.run_start_uids)
 
+    async def _abort_coro(self, reason):
+        if self.state.is_idle:
+            raise TransitionError("RunEngine is already idle.")
+        print("Aborting: running cleanup and marking exit_status as 'abort'...")
+        self.interrupted = True
+        self._reason = reason
+
+        self.exit_status = "abort"
+        self._destroy_open_run_tracing_spans()
+
+        was_paused = self.state == "paused"
+        self.state = "aborting"
+        if was_paused:
+            with self.state_lock:
+                self.exception = RequestAbort()
+        else:
+            self.task.cancel()
+
+        if self._call_returns_result:
+            plan_return = NO_PLAN_RETURN
+            run_engine_result = self._create_result(plan_return)
+            return run_engine_result
+        else:
+            return tuple(self.run_start_uids)
+
     def _create_result(self, plan_return):
         """
         Create a RunEngineResult to return from __call__, using
@@ -2723,32 +2748,7 @@ class RunEngine:
         :meth:`RunEngine.halt`
         :meth:`RunEngine.stop`
         """
-        return self.__interrupter_helper(self._abort_coro(reason))
-
-    async def _abort_coro(self, reason):
-        if self.state.is_idle:
-            raise TransitionError("RunEngine is already idle.")
-        print("Aborting: running cleanup and marking exit_status as 'abort'...")
-        self._single_run_executor.interrupted = True
-        self._reason = reason
-
-        self._single_run_executor.exit_status = "abort"
-        self._destroy_open_run_tracing_spans()
-
-        was_paused = self.state == "paused"
-        self._single_run_executor.state = "aborting"
-        if was_paused:
-            with self._single_run_executor.state_lock:
-                self._single_run_executor.exception = RequestAbort()
-        else:
-            self._single_run_executor.task.cancel()
-
-        if self._call_returns_result:
-            plan_return = NO_PLAN_RETURN
-            run_engine_result = self._create_result(plan_return)
-            return run_engine_result
-        else:
-            return tuple(self._single_run_executor.run_start_uids)
+        return self.__interrupter_helper(self._single_run_executor._abort_coro(reason))
 
     def stop(self):
         """
@@ -2807,7 +2807,7 @@ class RunEngine:
         :meth:`RunEngine.abort`
         :meth:`RunEngine.stop`
         """
-        return self.__interrupter_helper(self._halt_coro())
+        return self.__interrupter_helper(self._single_run_executor._halt_coro())
 
     def __interrupter_helper(self, coro):
         if self.state == "panicked":
