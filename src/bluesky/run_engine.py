@@ -269,11 +269,6 @@ class SingleRunExecutor:
 
         self.scan_id_source = scan_id_source
 
-        if sys.version_info < (3, 8):  # noqa: UP036
-            self.loop_for_kwargs = {"loop": self.loop}
-        else:
-            self.loop_for_kwargs: dict[str, asyncio.AbstractEventLoop] = {}
-
         self._blocking_event = blocking_event
 
         # When cleared, RunEngine._run will pause until set.
@@ -499,7 +494,7 @@ class SingleRunExecutor:
                     # current plan stack before rather than allowing a pause or
                     # suspension to try and finish firing.
                     if stashed_exception is None:
-                        await asyncio.sleep(0, **self.loop_for_kwargs)
+                        await asyncio.sleep(0)
                     # always pop off a result, we are either sending it back in
                     # or throwing an exception in, in either case the left hand
                     # side of the yield in the plan will be moved past
@@ -667,15 +662,15 @@ class SingleRunExecutor:
             self.exit_status = "success"
             plan_return = e.value
             # TODO Is the sleep here necessary?
-            await asyncio.sleep(0, **self.loop_for_kwargs)
+            await asyncio.sleep(0)
         except RequestStop:
             self.exit_status = "success"
             # TODO Is the sleep here necessary?
-            await asyncio.sleep(0, **self.loop_for_kwargs)
+            await asyncio.sleep(0)
         except (FailedPause, RequestAbort, asyncio.CancelledError, PlanHalt):
             self.exit_status = "abort"
             # TODO Is the sleep here necessary?
-            await asyncio.sleep(0, **self.loop_for_kwargs)
+            await asyncio.sleep(0)
             self.log.exception("Run aborted")
         except GeneratorExit as err:
             self.exit_status = "fail"  # Exception raises during 'running'
@@ -752,7 +747,7 @@ class SingleRunExecutor:
 
         (futs,) = msg.args
         futs = [asyncio.ensure_future(f()) for f in futs]
-        completed, pending = await asyncio.wait(futs, **self.loop_for_kwargs, **msg.kwargs)
+        completed, pending = await asyncio.wait(futs, **msg.kwargs)
         if pending:
             raise WaitForTimeoutError("Plan failed to complete in the specified time")
         return futs
@@ -1326,7 +1321,7 @@ class SingleRunExecutor:
 
         where `sleep_time` is in seconds
         """
-        await asyncio.sleep(*msg.args, **self.loop_for_kwargs)
+        await asyncio.sleep(*msg.args)
 
     async def _pause(self, msg):
         """Request the run engine to pause
@@ -1376,7 +1371,8 @@ class SingleRunExecutor:
             # We are at a checkpoint; we are done deferring the pause.
             # Give the _check_for_signals coroutine time to look for
             # additional SIGINTs that would trigger an abort.
-            await asyncio.sleep(0.5, **self.loop_for_kwargs)
+            # TODO JA: is this sleep necessary?
+            await asyncio.sleep(0.5)
             await self.request_pause_coro(defer=False)
 
     def _reset_checkpoint_state(self):
@@ -1945,7 +1941,7 @@ class RunEngine:
         setup_event = threading.Event()
 
         def setup_run_permit():
-            self._single_run_executor.run_permit = asyncio.Event(**self._single_run_executor.loop_for_kwargs)
+            self._single_run_executor.run_permit = asyncio.Event()
             self._single_run_executor.run_permit.set()
             setup_event.set()
 
@@ -2213,7 +2209,7 @@ class RunEngine:
         self._reason = ""
         self._single_run_executor.task = None
         self._task_fut = None
-        self._single_run_executor.pardon_failures = asyncio.Event(**self._single_run_executor.loop_for_kwargs)
+        self._single_run_executor.pardon_failures = asyncio.Event()
         self._single_run_executor.plan = None
         self._single_run_executor.interrupted = False
 
