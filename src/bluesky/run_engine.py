@@ -2052,11 +2052,17 @@ class RunEngine:
             blocking_event=self._blocking_event,
         )
 
-        # TODO: for coherence with tests,
-        # these attributes are kept but they should be
-        # reworked at some point...
+        # TODO: for the sake of backwards
+        # compatibility with the current test suite,
+        # these private attributes are being set
+        # on the run engine but since they're
+        # moved inside the single run executor,
+        # the tests will have to be updated
+        # to access the attributes from the executor
+        # instead
         self._th = self._single_run_executor.th
         self._loop = self._single_run_executor.loop
+        self._seen_wait_and_move_on_keys = self._single_run_executor._seen_wait_and_move_on_keys
 
         setup_event = threading.Event()
 
