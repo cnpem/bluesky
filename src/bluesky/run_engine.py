@@ -283,12 +283,12 @@ class SingleRunExecutor:
         self.state_hook = None
         self.pardon_failures = None  # will hold an asyncio.Event
         self.exception = None  # stored and then raised in the _run loop
-        self._rewindable_flag: bool = True  # if the RE is allowed to replay msgs
+        self._rewindable_flag = True  # if the RE is allowed to replay msgs
         self.record_interruptions = False
         self._require_stream_declaration = False
         self.deferred_pause_requested = False  # pause at next 'checkpoint'
-        self.plan = None  # the plan instance from __call__
-        self.task = None  # asyncio.Task associated with call to self._run
+        self.plan: typing.Iterable[Msg] | None = None  # the plan instance from __call__
+        self.task: asyncio.Task[typing.Any] | None = None  # asyncio.Task associated with call to self._run
         self.exit_status = "success"  # optimistic default
         self.interrupted = False  # True if paused, aborted, or failed
 
@@ -307,6 +307,9 @@ class SingleRunExecutor:
         self._status_objs: defaultdict[typing.Any, set[typing.Any]] = defaultdict(
             set
         )  # status objects to wait for
+        self._seen_wait_and_move_on_keys: set[typing.Any] = (
+            set()
+        )  # group ids that have been passed to _wait_and_move_on
 
         self.run_tracing_spans: list[Span] = []
 
@@ -1990,9 +1993,6 @@ class RunEngine:
         self._call_returns_result = call_returns_result  # should __call__ return UIDs or plan value
         self._suspenders: set[typing.Any] = set()  # set holding suspenders
         self._temp_callback_ids: set[typing.Any] = set()  # ids from CallbackRegistry
-        self._seen_wait_and_move_on_keys: set[typing.Any] = (
-            set()
-        )  # group ids that have been passed to _wait_and_move_on
         self._reason = ""  # reason for abort
         self._task_fut = None  # future proxy to the task above
 
