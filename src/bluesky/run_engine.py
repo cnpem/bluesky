@@ -212,6 +212,9 @@ def _state_locked(func):
     return inner
 
 
+NO_PLAN_RETURN = object()
+
+
 class SingleRunExecutor:
     RunBundler = RunBundler
 
@@ -248,6 +251,7 @@ class SingleRunExecutor:
         md_validator: typing.Callable | None = None,
         md_normalizer: typing.Callable | None = None,
         blocking_event: threading.Event | None = None,
+        call_returns_result: bool = False,
     ):
         if loop is None:
             loop = asyncio.new_event_loop()
@@ -270,6 +274,7 @@ class SingleRunExecutor:
         self.scan_id_source = scan_id_source
 
         self._blocking_event = blocking_event
+        self._call_returns_result = call_returns_result
 
         # When cleared, RunEngine._run will pause until set.
         self.waiting_hook = None
@@ -1756,6 +1761,49 @@ class SingleRunExecutor:
 
         self.task.cancel()
 
+    async def _halt_coro(self):
+        if self.state.is_idle:
+            raise TransitionError("RunEngine is already idle.")
+        print("Halting: skipping cleanup and marking exit_status as 'abort'...")
+        self._destroy_open_run_tracing_spans()
+        self.interrupted = True
+        was_paused = self.state == "paused"
+        self.state = "halting"
+        if was_paused:
+            with self.state_lock:
+                self.exception = PlanHalt
+                self.exit_status = "abort"
+        else:
+            self.task.cancel()
+
+        if self._call_returns_result:
+            plan_return = NO_PLAN_RETURN
+            run_engine_result = self._create_result(plan_return)
+            return run_engine_result
+        else:
+            return tuple(self.run_start_uids)
+
+    def _create_result(self, plan_return):
+        """
+        Create a RunEngineResult to return from __call__, using
+        plan_return and internal state
+        """
+        rs = RunEngineResult(
+            tuple(self.run_start_uids),
+            plan_return,
+            self.exit_status,
+            self.interrupted,
+            self._reason,
+            self.exception,
+        )
+        return rs
+
+    def _destroy_open_run_tracing_spans(self):
+        while len(self.run_tracing_spans):
+            _span = self.run_tracing_spans.pop()
+            _span.set_attribute("exit_status", "aborted")
+            _span.end()
+
 
 class RunEngine:
     """The Run Engine execute messages and emits Documents.
@@ -2004,7 +2052,6 @@ class RunEngine:
 
         self.max_depth = None
         self.pause_msg = PAUSE_MSG
-        self.NO_PLAN_RETURN = object()
 
         if during_task is None:
             during_task = DefaultDuringTask()
@@ -2528,7 +2575,7 @@ class RunEngine:
                 try:
                     return self._task_fut.result()
                 except concurrent.futures.CancelledError:
-                    return self.NO_PLAN_RETURN
+                    return NO_PLAN_RETURN
             # The _run task is waiting on this Event. Let is continue.
             self.loop.call_soon_threadsafe(self._single_run_executor.run_permit.set)
             try:
@@ -2577,12 +2624,12 @@ class RunEngine:
                         try:
                             plan_return = self._task_fut.result()
                         except concurrent.futures.CancelledError:
-                            plan_return = self.NO_PLAN_RETURN
+                            plan_return = NO_PLAN_RETURN
                     # we have something in exc
                     else:
                         # special case the panic exception that we put in above
                         if isinstance(exc, _RunEnginePanic):
-                            plan_return = self.NO_PLAN_RETURN
+                            plan_return = NO_PLAN_RETURN
                         # otherwise re-raise it
                         else:
                             raise exc
@@ -2600,7 +2647,7 @@ class RunEngine:
         :meth:`RunEngine.remove_suspender`
         """
         for sus in self.suspenders:
-            self.remove_suspender(sus)
+            self._single_run_executor.remove_suspender(sus)
 
     def request_suspend(self, fut, *, pre_plan=None, post_plan=None, justification=None):
         """Request that the run suspend itself until the future is finished.
@@ -2697,7 +2744,7 @@ class RunEngine:
             self._single_run_executor.task.cancel()
 
         if self._call_returns_result:
-            plan_return = self.NO_PLAN_RETURN
+            plan_return = NO_PLAN_RETURN
             run_engine_result = self._create_result(plan_return)
             return run_engine_result
         else:
@@ -2737,7 +2784,7 @@ class RunEngine:
             self._single_run_executor.task.cancel()
 
         if self._call_returns_result:
-            plan_return = self.NO_PLAN_RETURN
+            plan_return = NO_PLAN_RETURN
             run_engine_result = self._create_result(plan_return)
             return run_engine_result
         else:
@@ -2785,34 +2832,6 @@ class RunEngine:
             self._resume_task()
 
         return task.result()
-
-    async def _halt_coro(self):
-        if self.state.is_idle:
-            raise TransitionError("RunEngine is already idle.")
-        print("Halting: skipping cleanup and marking exit_status as 'abort'...")
-        self._destroy_open_run_tracing_spans()
-        self._single_run_executor.interrupted = True
-        was_paused = self.state == "paused"
-        self._single_run_executor.state = "halting"
-        if was_paused:
-            with self._single_run_executor.state_lock:
-                self._single_run_executor.exception = PlanHalt
-                self._single_run_executor.exit_status = "abort"
-        else:
-            self._single_run_executor.task.cancel()
-
-        if self._call_returns_result:
-            plan_return = self.NO_PLAN_RETURN
-            run_engine_result = self._create_result(plan_return)
-            return run_engine_result
-        else:
-            return tuple(self._single_run_executor.run_start_uids)
-
-    def _destroy_open_run_tracing_spans(self):
-        while len(self._single_run_executor.run_tracing_spans):
-            _span = self._single_run_executor.run_tracing_spans.pop()
-            _span.set_attribute("exit_status", "aborted")
-            _span.end()
 
 
 class Dispatcher:
