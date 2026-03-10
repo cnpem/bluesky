@@ -2003,6 +2003,8 @@ class RunEngine:
 
     """
 
+    NO_PLAN_RETURN = NO_PLAN_RETURN
+
     @property
     def log(self):
         return self._single_run_executor.log
