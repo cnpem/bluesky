@@ -2065,6 +2065,7 @@ class RunEngine:
         self._run_bundlers = self._single_run_executor.run_bundlers
         self._task = self._single_run_executor.task
         self._state = self._single_run_executor.state
+        self._require_stream_declaration = self._single_run_executor._require_stream_declaration
 
         setup_event = threading.Event()
 
@@ -2200,6 +2201,36 @@ class RunEngine:
             commands = commands + f"{command} : {docstring}\n"
 
         return commands
+
+    def install_suspender(self, suspender):
+        """
+        Install a 'suspender', which can suspend and resume execution.
+
+        Parameters
+        ----------
+        suspender : `bluesky.suspenders.SuspenderBase`
+
+        See Also
+        --------
+        :meth:`RunEngine.remove_suspender`
+        :meth:`RunEngine.clear_suspenders`
+        """
+        self._single_run_executor.install_suspender(suspender)
+
+    def remove_suspender(self, suspender):
+        """
+        Uninstall a suspender.
+
+        Parameters
+        ----------
+        suspender : `bluesky.suspenders.SuspenderBase`
+
+        See Also
+        --------
+        :meth:`RunEngine.install_suspender`
+        :meth:`RunEngine.clear_suspenders`
+        """
+        self._single_run_executor.remove_suspender(suspender)
 
     def subscribe(self, func, name="all"):
         """
