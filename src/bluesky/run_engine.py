@@ -243,6 +243,18 @@ class SingleRunExecutor:
     def state(self, value):
         self._state = value
 
+    # TODO: this is effectively a way to patch
+    # tests which access the RE loop directly as
+    # RE._loop; since we're now passing the loop
+    # from the executor and this is a public attribute,
+    # for now we use this shortcut.
+    # The suspenders though should not access the
+    # private attribute but the public property,
+    # so it's a bug on the suspenders... probably?
+    @property
+    def _loop(self):
+        return self.loop
+
     def __init__(
         self,
         md: dict | None = None,
