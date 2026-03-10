@@ -286,7 +286,7 @@ class SingleRunExecutor:
         self.scan_id_source = scan_id_source
 
         self._blocking_event = blocking_event
-        self._call_returns_result = call_returns_result
+        self._call_returns_result = call_returns_result # should __call__ return UIDs or plan value
 
         # When cleared, RunEngine._run will pause until set.
         self.waiting_hook = None
@@ -2018,6 +2018,42 @@ class RunEngine:
     def state(self):
         return self._single_run_executor.state
 
+    # TODO: this _state and its setter
+    # are here to preserve the test suite,
+    # but the tests should be updated
+    # to either access the state from
+    # the executor or to use the public state property
+    @property
+    def _state(self):
+        return self._single_run_executor._state
+
+    @_state.setter
+    def _state(self, value):
+        self._single_run_executor._state = value
+
+    # TODO: same as _state, here to preserve the test suite
+    @property
+    def _task(self):
+        return self._single_run_executor.task
+
+    # TODO: same as _state, here to preserve the test suite
+    @property
+    def _require_stream_declaration(self):
+        return self._single_run_executor._require_stream_declaration
+
+    @_require_stream_declaration.setter
+    def _require_stream_declaration(self, value):
+        self._single_run_executor._require_stream_declaration = value
+
+    # TODO: same as _state, here to preserve the test suite
+    @property
+    def _call_returns_result(self):
+        return self._single_run_executor._call_returns_result
+
+    @_call_returns_result.setter
+    def _call_returns_result(self, value):
+        self._single_run_executor._call_returns_result = value
+
     @property
     def deferred_pause_requested(self):
         """
@@ -2057,6 +2093,7 @@ class RunEngine:
             md_validator=md_validator,
             md_normalizer=md_normalizer,
             blocking_event=self._blocking_event,
+            call_returns_result=call_returns_result,
         )
 
         self._single_run_executor.command_registry.update({"RE_class": self._RE_class})
@@ -2075,9 +2112,6 @@ class RunEngine:
         self.dispatcher = self._single_run_executor.dispatcher
         self._command_registry = self._single_run_executor.command_registry
         self._run_bundlers = self._single_run_executor.run_bundlers
-        self._task = self._single_run_executor.task
-        self._state = self._single_run_executor.state
-        self._require_stream_declaration = self._single_run_executor._require_stream_declaration
 
         setup_event = threading.Event()
 
@@ -2126,7 +2160,6 @@ class RunEngine:
 
         # The RunEngine keeps track of a *lot* of state.
         # All flags and caches are defined here with a comment. Good luck.
-        self._call_returns_result = call_returns_result  # should __call__ return UIDs or plan value
         self._reason = ""  # reason for abort
         self._task_fut = None  # future proxy to the task above
 
