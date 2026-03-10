@@ -1607,7 +1607,16 @@ class SingleRunExecutor:
         :meth:`RunEngine.clear_suspenders`
         """
         self._suspenders.add(suspender)
-        suspender.install(self)
+
+        # TODO: the suspender API expects a RunEngine
+        # object, not a SingleRunExecutor. For now,
+        # the executor is monkey-patched at __init__
+        # to ensure that a reference to the RunEngine
+        # is available as the "_owner" attribute.
+        # Not ideal, but the refactor needs to happen
+        # in the suspender API at some point
+        owner = getattr(self, "_owner", self)
+        suspender.install(owner)
 
     async def _install_suspender(self, msg):
         """
@@ -2112,6 +2121,13 @@ class RunEngine:
         self.dispatcher = self._single_run_executor.dispatcher
         self._command_registry = self._single_run_executor.command_registry
         self._run_bundlers = self._single_run_executor.run_bundlers
+
+        # TODO: monkey patching the executor with the _owner attribute
+        # serves to ensure that when a suspender is installed, the suspender
+        # will get the RunEngine instance as argument instead of the executor,
+        # as the suspender API still expects a RunEngine instance.
+        # Eventually the suspender should accept a SingleRunExecutor
+        self._single_run_executor._owner = self # type: ignore[attr-defined]
 
         setup_event = threading.Event()
 
