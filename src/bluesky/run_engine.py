@@ -342,7 +342,6 @@ class SingleRunExecutor:
             "monitor": self._monitor,
             "unmonitor": self._unmonitor,
             "null": self._null,
-            "RE_class": self._RE_class,
             "stop": self._stop,
             "set": self._set,
             "trigger": self._trigger,
@@ -1138,12 +1137,6 @@ class SingleRunExecutor:
         A no-op message, mainly for debugging and testing.
         """
         pass
-
-    async def _RE_class(self, msg):
-        """
-        A no-op message, mainly for debugging and testing.
-        """
-        return type(self)
 
     @tracer.start_as_current_span(f"{_SPAN_NAME_PREFIX} set")
     async def _set(self, msg):
@@ -2054,6 +2047,8 @@ class RunEngine:
             blocking_event=self._blocking_event,
         )
 
+        self._single_run_executor.command_registry.update({"RE_class": self._RE_class})
+
         # TODO: for the sake of backwards
         # compatibility with the current test suite,
         # these private attributes are being set
@@ -2853,6 +2848,12 @@ class RunEngine:
             self._resume_task()
 
         return task.result()
+
+    async def _RE_class(self, msg):
+        """
+        A no-op message, mainly for debugging and testing.
+        """
+        return type(self)
 
 
 class Dispatcher:
