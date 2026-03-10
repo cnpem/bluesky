@@ -2066,6 +2066,8 @@ class RunEngine:
         self.dispatcher = self._single_run_executor.dispatcher
         self._command_registry = self._single_run_executor.command_registry
         self._run_bundlers = self._single_run_executor.run_bundlers
+        self._task = self._single_run_executor.task
+        self._state = self._single_run_executor.state
 
         setup_event = threading.Event()
 
@@ -2135,6 +2137,10 @@ class RunEngine:
     @property
     def state_hook(self):
         return self._single_run_executor.state_hook
+
+    @state_hook.setter
+    def state_hook(self, v):
+        self._single_run_executor.state_hook = v
 
     @property
     def scan_id_source(self):
