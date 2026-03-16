@@ -2742,7 +2742,7 @@ class RunEngine:
                     #
                     # Here we cheat a bit and use ctypes.
                     num_threads = ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                        ctypes.c_ulong(self._single_run_executor.th.ident), ctypes.py_object(_RunEnginePanic)
+                        ctypes.c_ulong(self._th.ident), ctypes.py_object(_RunEnginePanic)
                     )
                     # however, if the thread is in a system call (such
                     # as sleep or I/O) there is no way to interrupt it
