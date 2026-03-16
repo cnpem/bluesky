@@ -8,6 +8,7 @@ import sys
 import threading
 import typing
 import weakref
+from asyncio import current_task
 from collections import ChainMap, defaultdict, deque
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -69,16 +70,6 @@ from .utils import (
 )
 
 _SPAN_NAME_PREFIX = "Bluesky RunEngine"
-
-current_task: typing.Callable[[asyncio.AbstractEventLoop | None], asyncio.Task | None]
-try:
-    from asyncio import current_task
-except ImportError:
-    # handle py < 3,7
-    from asyncio.tasks import Task
-
-    current_task = Task.current_task  # type: ignore
-    del Task
 
 
 class _RunEnginePanic(Exception): ...
@@ -286,7 +277,7 @@ class SingleRunExecutor:
         self.scan_id_source = scan_id_source
 
         self._blocking_event = blocking_event
-        self._call_returns_result = call_returns_result # should __call__ return UIDs or plan value
+        self._call_returns_result = call_returns_result  # should __call__ return UIDs or plan value
 
         # When cleared, RunEngine._run will pause until set.
         self.waiting_hook = None
@@ -2127,7 +2118,7 @@ class RunEngine:
         # will get the RunEngine instance as argument instead of the executor,
         # as the suspender API still expects a RunEngine instance.
         # Eventually the suspender should accept a SingleRunExecutor
-        self._single_run_executor._owner = self # type: ignore[attr-defined]
+        self._single_run_executor._owner = self  # type: ignore[attr-defined]
 
         setup_event = threading.Event()
 
