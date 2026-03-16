@@ -243,24 +243,20 @@ class SingleRunExecutor:
     # private attribute but the public property,
     # so it's a bug on the suspenders... probably?
     @property
-    def _loop(self):
-        return self.loop
+    def loop(self):
+        return self._loop
 
     def __init__(
         self,
+        loop: asyncio.AbstractEventLoop,
         md: dict | None = None,
-        loop: asyncio.AbstractEventLoop | None = None,
         scan_id_source: typing.Callable[[dict], SyncOrAsync[int]] = default_scan_id_source,
         md_validator: typing.Callable | None = None,
         md_normalizer: typing.Callable | None = None,
         blocking_event: threading.Event | None = None,
         call_returns_result: bool = False,
     ):
-        if loop is None:
-            loop = asyncio.new_event_loop()
-        set_bluesky_event_loop(loop)
-        self.th = _ensure_event_loop_running(loop)
-        self.loop = loop
+        self._loop = loop
 
         if md_validator is None:
             md_validator = _default_md_validator
@@ -2083,12 +2079,18 @@ class RunEngine:
         during_task: DuringTask | None = None,
         call_returns_result: bool = False,
     ):
+        if loop is None:
+            loop = asyncio.new_event_loop()
+        set_bluesky_event_loop(loop)
+        self._th = _ensure_event_loop_running(loop)
+        self._loop = loop
+
         # When set, RunEngine.__call__ should stop blocking.
         self._blocking_event = threading.Event()
 
         self._single_run_executor = SingleRunExecutor(
             md=md,
-            loop=loop,
+            loop=self._loop,
             scan_id_source=scan_id_source,
             md_validator=md_validator,
             md_normalizer=md_normalizer,
@@ -2106,8 +2108,6 @@ class RunEngine:
         # the tests will have to be updated
         # to access the attributes from the executor
         # instead
-        self._th = self._single_run_executor.th
-        self._loop = self._single_run_executor.loop
         self._seen_wait_and_move_on_keys = self._single_run_executor._seen_wait_and_move_on_keys
         self.dispatcher = self._single_run_executor.dispatcher
         self._command_registry = self._single_run_executor.command_registry
