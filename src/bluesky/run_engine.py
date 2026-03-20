@@ -1852,6 +1852,28 @@ class SingleRunExecutor:
             _span.set_attribute("exit_status", "aborted")
             _span.end()
 
+    def clear_call_cache(self):
+        self.metadata_per_call.clear()
+        self.staged.clear()
+        self.objs_seen.clear()
+        self.movable_objs_touched.clear()
+        self.deferred_pause_requested = False
+        self.plan_stack = deque()
+        self.msg_cache = deque()
+        self.response_stack = deque()
+        self.exception = None
+        self.run_start_uids.clear()
+        self.exit_status = "success"
+        self._reason = ""
+        self.task = None
+        self.pardon_failures = asyncio.Event()
+        self.plan = None
+        self.interrupted = False
+        # Unsubscribe for per-run callbacks.
+        for cid in self._temp_callback_ids:
+            self.unsubscribe(cid)
+        self._temp_callback_ids.clear()
+
 
 class RunEngine:
     """The Run Engine execute messages and emits Documents.
@@ -2418,28 +2440,9 @@ class RunEngine:
     @_state_locked
     def _clear_call_cache(self):
         "Clean up for a new __call__ (which may encompass multiple runs)."
-        self._single_run_executor.metadata_per_call.clear()
-        self._single_run_executor.staged.clear()
-        self._single_run_executor.objs_seen.clear()
-        self._single_run_executor.movable_objs_touched.clear()
-        self._single_run_executor.deferred_pause_requested = False
-        self._single_run_executor.plan_stack = deque()
-        self._single_run_executor.msg_cache = deque()
-        self._single_run_executor.response_stack = deque()
-        self._single_run_executor.exception = None
-        self._single_run_executor.run_start_uids.clear()
-        self._single_run_executor.exit_status = "success"
-        self._reason = ""
-        self._single_run_executor.task = None
+        self._single_run_executor.clear_call_cache()
         self._task_fut = None
-        self._single_run_executor.pardon_failures = asyncio.Event()
-        self._single_run_executor.plan = None
-        self._single_run_executor.interrupted = False
 
-        # Unsubscribe for per-run callbacks.
-        for cid in self._single_run_executor._temp_callback_ids:
-            self.unsubscribe(cid)
-        self._single_run_executor._temp_callback_ids.clear()
 
     def reset(self):
         """
