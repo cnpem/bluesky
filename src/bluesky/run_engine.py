@@ -1467,7 +1467,8 @@ class RunEngine:
                 except concurrent.futures.CancelledError:
                     return self.NO_PLAN_RETURN
             # The _run task is waiting on this Event. Let is continue.
-            self.loop.call_soon_threadsafe(self._run_permit.set)
+            for sre in self._sre_objs:
+                self.loop.call_soon_threadsafe(sre.re_instance._run_permit.set)
             try:
                 # Block until plan is complete or exception is raised.
                 try:
