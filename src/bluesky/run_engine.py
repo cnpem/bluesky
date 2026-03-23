@@ -307,7 +307,6 @@ class SingleRunEngine:
             self.re_instance._task = current_task(self.re_instance._loop)
         stashed_exception = None
         debug = msg_logger.debug
-        self.re_instance._reason = ""
         # sentinel to decide if need to add to the response stack or not
         sentinel = object()
         plan_return = self.NO_PLAN_RETURN
@@ -1134,13 +1133,14 @@ class RunEngine:
         self._exception = None
         self._run_start_uids.clear()
         self._exit_status = "success"
-        self._reason = ""
         self._task = None
         self._task_fut = None
         self._pardon_failures = asyncio.Event(**self._loop_for_kwargs)
         self._plan = None
         self._interrupted = False
-
+        self._reason = ""
+        for sre in self._sre_objs:
+            sre.re_instance._reason = ""
         # Unsubscribe for per-run callbacks.
         for cid in self._temp_callback_ids:
             self.unsubscribe(cid)
@@ -1367,6 +1367,7 @@ class RunEngine:
             # make sure _run will block at the top
             self._run_permit.clear()
             self._blocking_event.clear()
+            self._reason = ""
             sre = SingleRunEngine(self)
             self._sre_objs.append(sre)
             self._task_fut = asyncio.run_coroutine_threadsafe(sre._run(), loop=self.loop)
@@ -1732,6 +1733,8 @@ class RunEngine:
             raise TransitionError("RunEngine is already idle.")
         print("Aborting: running cleanup and marking exit_status as 'abort'...")
         self._interrupted = True
+        for sre in self._sre_objs:
+            sre.re_instance._reason = reason
         self._reason = reason
 
         self._exit_status = "abort"
