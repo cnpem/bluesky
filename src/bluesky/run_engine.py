@@ -213,10 +213,80 @@ def _state_locked(func):
     return inner
 
 
+class REInstance:
+    _run_permit = None
+    _reason = ""
+    _run_bundlers = None
+    _stop_movable_objects = None
+    _objs_seen = set()
+    _reset_checkpoint_state_meth = None
+    _blocking_event = threading.Event()
+    _response_stack = deque()
+    _plan_stack = deque()
+    _loop_for_kwargs = None
+    _exception = None
+    _rewindable_flag = True
+    _halt_coro = None
+    _exit_status = "success"
+    _pardon_failures = None
+    _staged = set()
+    _task = None
+    _plan = None
+    _state_lock = threading.RLock()
+    _state = None
+    _command_registry = {}
+    _loop = None
+    _msg_cache = deque()
+    msg_hook = None
+    log = None
+    resumable = True
+
+
 class SingleRunEngine:
 
-    def __init__(self, re_instance):
-        self.re_instance = re_instance
+    def __init__(self, re):
+        self.re_instance = REInstance()
+        self.re_instance._loop = re._loop
+        self.re_instance._run_permit = re._run_permit
+        self.re_instance._reason = re._reason
+        self.re_instance._run_bundlers = re._run_bundlers
+        self.re_instance._stop_movable_objects = re._stop_movable_objects
+        self.re_instance._objs_seen = re._objs_seen
+        self.re_instance._reset_checkpoint_state_meth = re._reset_checkpoint_state_meth
+        self.re_instance._blocking_event = re._blocking_event
+        self.re_instance._response_stack = re._response_stack
+        self.re_instance._plan_stack = re._plan_stack
+        self.re_instance._loop_for_kwargs = re._loop_for_kwargs
+        self.re_instance._exception = re._exception
+        self.re_instance._rewindable_flag = re._rewindable_flag
+        self.re_instance._halt_coro = re._halt_coro
+        self.re_instance._exit_status = re._exit_status
+        self.re_instance._pardon_failures = re._pardon_failures
+        self.re_instance._staged = re._staged
+        self.re_instance._task = re._task
+        self.re_instance._plan = re._plan
+        self.re_instance._state_lock = re._state_lock
+        self.re_instance._state = re._state
+        self.re_instance._command_registry = re._command_registry
+        self.re_instance.log = re.log
+        self.re_instance._msg_cache = re._msg_cache
+        self.re_instance.resumable = re.resumable
+        self.re_instance.msg_hook = re.msg_hook
+        self.NO_PLAN_RETURN = object()
+        self._UNCACHEABLE_COMMANDS = [
+            "pause",
+            "subscribe",
+            "unsubscribe",
+            "stage",
+            "unstage",
+            "monitor",
+            "unmonitor",
+            "open_run",
+            "close_run",
+            "install_suspender",
+            "remove_suspender",
+            "_start_suspender",
+        ]
 
     async def _run(self):
         """Pull messages from the plan, process them, send results back.
@@ -234,13 +304,13 @@ class SingleRunEngine:
         # that acts as a proxy that does not have the correct behavior
         # when `.cancel` is called on it.
         with self.re_instance._state_lock:
-            self.re_instance._task = current_task(self.re_instance.loop)
+            self.re_instance._task = current_task(self.re_instance._loop)
         stashed_exception = None
         debug = msg_logger.debug
         self.re_instance._reason = ""
         # sentinel to decide if need to add to the response stack or not
         sentinel = object()
-        plan_return = self.re_instance.NO_PLAN_RETURN
+        plan_return = self.NO_PLAN_RETURN
         exit_reason = ""
         try:
             self.re_instance._state = "running"
@@ -404,7 +474,7 @@ class SingleRunEngine:
                     if (
                         self.re_instance._msg_cache is not None
                         and self.re_instance._rewindable_flag
-                        and msg.command not in self.re_instance._UNCACHEABLE_COMMANDS
+                        and msg.command not in self._UNCACHEABLE_COMMANDS
                     ):
                         # We have a checkpoint.
                         self.re_instance._msg_cache.append(msg)
@@ -705,21 +775,6 @@ class RunEngine:
     """
 
     _state = LoggingPropertyMachine(RunEngineStateMachine)
-    _UNCACHEABLE_COMMANDS = [
-        "pause",
-        "subscribe",
-        "unsubscribe",
-        "stage",
-        "unstage",
-        "monitor",
-        "unmonitor",
-        "open_run",
-        "close_run",
-        "install_suspender",
-        "remove_suspender",
-        "_start_suspender",
-    ]
-
     RunBundler = RunBundler
 
     @property
