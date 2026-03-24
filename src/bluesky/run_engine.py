@@ -11,7 +11,7 @@ import weakref
 from collections import ChainMap, defaultdict, deque
 from collections.abc import Callable
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from inspect import iscoroutine
@@ -68,6 +68,9 @@ from .utils import (
     single_gen,
     warn_if_msg_args_or_kwargs,
 )
+
+if typing.TYPE_CHECKING:
+    from types import CoroutineType
 
 _SPAN_NAME_PREFIX = "Bluesky RunEngine"
 
@@ -212,6 +215,101 @@ def _state_locked(func):
 
     return inner
 
+@dataclass
+class _ObjCache:
+    """Cache of objects interacting with the RunEngine."""
+
+    seen_objs: set[typing.Any] = field(default_factory=set)
+    """All objects that have been seen in messages."""
+
+    movable_objs_touched: set[Movable] = field(default_factory=set)
+    """Objects that have been 'set'."""
+
+    status_objs: defaultdict[str, set[Status]] = field(default_factory=lambda: defaultdict(set))
+    """Status objects keyed by group."""
+
+    seen_wait_and_move_on_keys: set[str] = field(default_factory=set)
+    """Keys for which we have seen 'wait'."""
+
+    run_bundlers: dict[str, RunBundler] = field(default_factory=dict)
+    """RunBundler objects keyed by run id."""
+
+    temp_callback_ids: set[int] = field(default_factory=set)
+    """Set of temporary callbacks indexed by their id token."""
+
+    staged: set[Stageable] = field(default_factory=set)
+    """Set of currently staged objects, yet to be unstaged."""
+
+@dataclass
+class _StateCache:
+    """Cache of state information for the RunEngine."""
+    loop: asyncio.AbstractEventLoop
+    """The event loop on which the RunEngine is running."""
+
+    current_task: asyncio.Task = field(init=False)
+    """The current asyncio task running the plan."""
+
+    run_permit: asyncio.Event = field(init=False)
+    """Run permit event that controls when the RunEngine is allowed to run."""
+
+    pardon_failures: asyncio.Event = field(init=False)
+    """Event that, when set, allows failure tasks to be created on the loop."""
+
+    blocking_event: threading.Event
+    """Event to block the main thread during execution."""
+
+    command_registry: dict[str, typing.Any]
+    """Map of command names to their corresponding coroutines."""
+
+    rewindable_flag: bool
+    """Flag indicating whether the current state is rewindable."""
+
+    exception: Exception | None
+    """Cached exception, if any, that has been raised during execution."""
+
+    plan: typing.Iterable[Msg] = field(init=False)
+    """The current plan being executed."""
+
+    plan_stack: deque[typing.Any] = field(default_factory=deque)
+    """Stack of active plans (generators) being executed."""
+
+    response_stack: deque[typing.Any] = field(default_factory=deque)
+    """Stack of responses corresponding to the active plans."""
+
+    msg_cache: deque[Msg] = field(default_factory=deque)
+    """Cache of messages for potential rewinding."""
+
+    exit_status: str
+    """Exit status of the current run."""
+
+    def __post_init__(self) -> None:
+        async def _create_event() -> asyncio.Event:
+            return asyncio.Event()
+
+        self.run_permit = asyncio.run_coroutine_threadsafe(_create_event(), self.loop).result()
+        self.pardon_failures = asyncio.run_coroutine_threadsafe(_create_event(), self.loop).result()
+
+    def clear(self) -> None:
+        """Clear or reset all cached state information."""
+        # TODO: implement later
+
+@dataclass
+class _InternalCallbackCache:
+    """Cache of internal callbacks for the RunEngine.
+
+    Differently from document callbacks, these
+    functions serve as a way for a two-way
+    communcation between the RunEngine and SingleRunExecutors.
+    """
+
+    halt_coro: Callable[[], CoroutineType[typing.Any, typing.Any, typing.Any]]
+    """Coroutine function to be called to halt the RunEngine."""
+
+    reset_checkpoint_state: Callable[[], None]
+    """Function to be called to reset the checkpoint state."""
+
+    msg_hook: Callable[[Msg], None] | None
+    """Optional message hook to be called with each message before processing."""
 
 class REInstance:
     _run_permit = None
