@@ -206,11 +206,12 @@ def _state_locked(func):
 
     return inner
 
+
 @dataclass
 class _ObjCache:
     """Cache of objects interacting with the RunEngine."""
 
-    seen_objs: set[typing.Any] = field(default_factory=set)
+    objs_seen: set[typing.Any] = field(default_factory=set)
     """All objects that have been seen in messages."""
 
     movable_objs_touched: set[Movable] = field(default_factory=set)
@@ -231,13 +232,19 @@ class _ObjCache:
     staged: set[Stageable] = field(default_factory=set)
     """Set of currently staged objects, yet to be unstaged."""
 
+    def clear(self) -> None:
+        """Clear or reset all cached object information."""
+        # TODO: implement later
+
+
 @dataclass
 class _StateCache:
     """Cache of state information for the RunEngine."""
+
     loop: asyncio.AbstractEventLoop
     """The event loop on which the RunEngine is running."""
 
-    current_task: asyncio.Task = field(init=False)
+    task: asyncio.Task | None = field(init=False, default=None)
     """The current asyncio task running the plan."""
 
     run_permit: asyncio.Event = field(init=False)
@@ -252,37 +259,43 @@ class _StateCache:
     command_registry: dict[str, typing.Any]
     """Map of command names to their corresponding coroutines."""
 
-    rewindable_flag: bool
-    """Flag indicating whether the current state is rewindable."""
-
     exception: Exception | None
     """Cached exception, if any, that has been raised during execution."""
+
+    rewindable_flag: bool = field(default=True)
+    """Flag indicating whether the current state is rewindable."""
+
+    resumable: bool = field(default=False)
+    """Flag indicating whether the current run can be resumed after a pause."""
 
     plan: typing.Iterable[Msg] = field(init=False)
     """The current plan being executed."""
 
-    plan_stack: deque[typing.Any] = field(default_factory=deque)
+    plan_stack: deque[typing.Any] = field(default_factory=deque, init=False)
     """Stack of active plans (generators) being executed."""
 
-    response_stack: deque[typing.Any] = field(default_factory=deque)
+    response_stack: deque[typing.Any] = field(default_factory=deque, init=False)
     """Stack of responses corresponding to the active plans."""
 
-    msg_cache: deque[Msg] = field(default_factory=deque)
+    msg_cache: deque[Msg] = field(default_factory=deque, init=False)
     """Cache of messages for potential rewinding."""
 
-    exit_status: str
+    exit_status: str = field(default="success", init=False)
     """Exit status of the current run."""
 
-    def __post_init__(self) -> None:
-        async def _create_event() -> asyncio.Event:
-            return asyncio.Event()
+    reason: str = field(default="")
 
-        self.run_permit = asyncio.run_coroutine_threadsafe(_create_event(), self.loop).result()
-        self.pardon_failures = asyncio.run_coroutine_threadsafe(_create_event(), self.loop).result()
+    def __post_init__(self) -> None:
+        asyncio.run_coroutine_threadsafe(self._create_events(), self.loop).result()
 
     def clear(self) -> None:
         """Clear or reset all cached state information."""
         # TODO: implement later
+
+    async def _create_events(self) -> None:
+        self.run_permit = asyncio.Event()
+        self.pardon_failures = asyncio.Event()
+
 
 @dataclass
 class _InternalCallbackCache:
@@ -292,6 +305,7 @@ class _InternalCallbackCache:
     functions serve as a way for a two-way
     communcation between the RunEngine and SingleRunExecutors.
     """
+
     set_state: Callable[[str], None]
     """Callback to be called with the current state of the RunEngine whenever it changes."""
 
@@ -299,85 +313,52 @@ class _InternalCallbackCache:
     """Callback to be called to get the current state of the RunEngine."""
 
     halt_coro: Callable[[], CoroutineType[typing.Any, typing.Any, typing.Any]]
-    """Coroutine function to be called to halt the RunEngine."""
+    """Coroutine to be called to halt the RunEngine."""
+
+    stop_movable_objects: Callable[[bool], CoroutineType[typing.Any, typing.Any, None]]
+    """
+    Coroutine to stop all tracked movable objects, with "success"
+    indicating whether to stop with success or failure semantics.
+    """
 
     reset_checkpoint_state: Callable[[], None]
-    """Function to be called to reset the checkpoint state."""
+    """Callable to reset the checkpoint state."""
 
-    msg_hook: Callable[[Msg], None] | None
-    """Optional message hook to be called with each message before processing."""
+    msg_hook: Callable[[Msg], None] | None = field(default=None)
+    """Optional message hook to call before processing a message."""
 
-class REInstance:
-    _run_permit = None
-    _reason = ""
-    _run_bundlers = None
-    _stop_movable_objects = None
-    _reset_checkpoint_state_meth = None
-    _blocking_event = threading.Event()
-    _response_stack = deque()
-    _plan_stack = deque()
-    _exception = None
-    _rewindable_flag = True
-    _halt_coro = None
-    _exit_status = "success"
-    _pardon_failures = None
-    _staged = set()
-    _task = None
-    _plan = None
-    _state_lock = threading.RLock()
-    _state = None
-    _command_registry = {}
-    _loop = None
-    _msg_cache = deque()
-    msg_hook = None
-    log = None
-    resumable = True
+
+_UNCACHEABLE_COMMANDS: set[str] = {
+    "pause",
+    "subscribe",
+    "unsubscribe",
+    "stage",
+    "unstage",
+    "monitor",
+    "unmonitor",
+    "open_run",
+    "close_run",
+    "install_suspender",
+    "remove_suspender",
+    "_start_suspender",
+}
 
 
 class SingleRunExecutor:
-
-    def __init__(self, re):
-        self.objs_seen: set[typing.Any] = set()  # all objects seen
-        self.re_instance = REInstance()
-        self.re_instance._loop = re._loop
-        self.re_instance._run_permit = re._run_permit
-        self.re_instance._reason = re._reason
-        self.re_instance._run_bundlers = re._run_bundlers
-        self.re_instance._stop_movable_objects = re._stop_movable_objects
-        self.re_instance._reset_checkpoint_state_meth = re._reset_checkpoint_state_meth
-        self.re_instance._blocking_event = re._blocking_event
-        self.re_instance._response_stack = re._response_stack
-        self.re_instance._plan_stack = re._plan_stack
-        self.re_instance._exception = re._exception
-        self.re_instance._rewindable_flag = re._rewindable_flag
-        self.re_instance._halt_coro = re._halt_coro
-        self.re_instance._exit_status = re._exit_status
-        self.re_instance._pardon_failures = re._pardon_failures
-        self.re_instance._staged = re._staged
-        self.re_instance._task = re._task
-        self.re_instance._plan = re._plan
-        self.re_instance._state_lock = re._state_lock
-        self.re_instance._state = re._state
-        self.re_instance._command_registry = re._command_registry
-        self.re_instance.log = re.log
-        self.re_instance._msg_cache = re._msg_cache
-        self.re_instance.resumable = re.resumable
-        self.re_instance.msg_hook = re.msg_hook
+    def __init__(
+        self,
+        objs_cache: _ObjCache,
+        state_cache: _StateCache,
+        cb_cache: _InternalCallbackCache,
+        state_lock: threading.RLock,
+        logger: ComposableLogAdapter,
+    ):
+        self.objs_cache = objs_cache
+        self.state_cache = state_cache
+        self.cb_cache = cb_cache
+        self._state_lock = state_lock
+        self.log = logger
         self.NO_PLAN_RETURN = object()
-        self._UNCACHEABLE_COMMANDS = [
-            "pause",
-            "subscribe",
-            "unsubscribe",
-            "stage",
-            "unstage",
-            "monitor",
-            "unmonitor",
-            "open_run",
-            "close_run",
-            "install_suspender",
-            "remove_suspender",
-            "_start_suspender",
-        ]
 
     async def _run(self):
         """Pull messages from the plan, process them, send results back.
@@ -389,13 +370,13 @@ class SingleRunExecutor:
         - Try to remove any monitoring subscriptions left on by the plan.
         - If interrupting the middle of a run, try to emit a RunStop document.
         """
-        await self.re_instance._run_permit.wait()
+        await self.state_cache.run_permit.wait()
         # grab the current task.  We need to do this here because the
         # object returned by `run_coroutine_threadsafe` is a future
         # that acts as a proxy that does not have the correct behavior
         # when `.cancel` is called on it.
-        with self.re_instance._state_lock:
-            self.re_instance._task = current_task(self.re_instance._loop)
+        with self._state_lock:
+            self.state_cache.task = current_task(self.state_cache.loop)
         stashed_exception = None
         debug = msg_logger.debug
         # sentinel to decide if need to add to the response stack or not
@@ -403,55 +384,53 @@ class SingleRunExecutor:
         plan_return = self.NO_PLAN_RETURN
         exit_reason = ""
         try:
-            self.re_instance._state = "running"
+            self.cb_cache.set_state("running")
             while True:
-                if self.re_instance._state in ("pausing", "suspending"):
-                    if not self.re_instance.resumable:
-                        self.re_instance._run_permit.set()
+                if self.cb_cache.get_state() in ("pausing", "suspending"):
+                    if not self.state_cache.resumable:
+                        self.state_cache.run_permit.set()
                         stashed_exception = FailedPause()
-
-                        self.re_instance._state = "aborting"
+                        self.cb_cache.set_state("aborting")
                         continue
                 # currently only using 'suspending' to get us into the
                 # block above, we do not have a 'suspended' state
                 # (yet)
-                if self.re_instance._state == "suspending":
-                    self.re_instance._state = "running"
-                if not self.re_instance._run_permit.is_set():
+                if self.cb_cache.get_state() == "suspending":
+                    self.cb_cache.set_state("running")
+                if not self.state_cache.run_permit.is_set():
                     # A pause has been requested. First, put everything in a
                     # resting state.
-                    assert self.re_instance._state == "pausing"
+                    assert self.cb_cache.get_state() == "pausing"
                     # Remove any monitoring callbacks, but keep refs in
                     # self.re_instance._monitor_params to re-instate them later.
-                    for current_run in self.re_instance._run_bundlers.values():
+                    for current_run in self.objs_cache.run_bundlers.values():
                         await current_run.suspend_monitors()
                     # During pause, all motors should be stopped. Call stop()
                     # on every object we ever set().
-                    await self.re_instance._stop_movable_objects(success=True)
+                    await self.cb_cache.stop_movable_objects(success=True)
                     # Notify Devices of the pause in case they want to
                     # clean up.
-                    for obj in self.objs_seen:
+                    for obj in self.objs_cache.objs_seen:
                         if isinstance(obj, Pausable):
                             try:
                                 await maybe_await(obj.pause())
                             except NoReplayAllowed:
-                                self.re_instance._reset_checkpoint_state_meth()
-                    self.re_instance._state = "paused"
+                                self.cb_cache.reset_checkpoint_state()
+                    self.cb_cache.set_state("paused")
                     # Let RunEngine.__call__ return...
-                    self.re_instance._blocking_event.set()
+                    self.state_cache.blocking_event.set()
 
-                    await self.re_instance._run_permit.wait()
+                    await self.state_cache.run_permit.wait()
                     # Restore any monitors
-                    for current_run in self.re_instance._run_bundlers.values():
+                    for current_run in self.objs_cache.run_bundlers.values():
                         await current_run.restore_monitors()
-                    if self.re_instance._state == "paused":
+                    if self.cb_cache.get_state() == "paused":
                         # may be called by 'resume', 'stop', 'abort', 'halt'
-                        self.re_instance._state = "running"
+                        self.cb_cache.set_state("running")
 
                     # If we are here, we have come back to life either to
                     # continue (resume) or to clean up before exiting.
-
-                assert len(self.re_instance._response_stack) == len(self.re_instance._plan_stack)
+                assert len(self.state_cache.response_stack) == len(self.state_cache.plan_stack)
                 # set resp to the sentinel so that if we fail in the sleep
                 # we do not add an extra response
                 resp = sentinel
@@ -480,29 +459,29 @@ class SingleRunExecutor:
                     # always pop off a result, we are either sending it back in
                     # or throwing an exception in, in either case the left hand
                     # side of the yield in the plan will be moved past
-                    resp = self.re_instance._response_stack.pop()
+                    resp = self.state_cache.response_stack.pop()
                     # if any status tasks have failed, grab the exceptions.
                     # give priority to things pushed in from outside
-                    with self.re_instance._state_lock:
-                        if self.re_instance._exception is not None:
-                            stashed_exception = self.re_instance._exception
-                            self.re_instance._exception = None
+                    with self._state_lock:
+                        if self.state_cache.exception is not None:
+                            stashed_exception = self.state_cache.exception
+                            self.state_cache.exception = None
                     # The case where we have a stashed exception
                     if stashed_exception is not None or isinstance(resp, Exception):
                         # throw the exception at the current plan
                         try:
-                            msg = self.re_instance._plan_stack[-1].throw(stashed_exception or resp)
+                            msg = self.state_cache.plan_stack[-1].throw(stashed_exception or resp)
                         except Exception as e:
                             # The current plan did not handle it,
                             # maybe the next plan (if any) would like
                             # to try
-                            self.re_instance._plan_stack.pop()
+                            self.state_cache.plan_stack.pop()
                             # we have killed the current plan, do not give
                             # it a new response
                             resp = sentinel
                             # If there is at least one plan left in the stack,
                             # stash the new exception go back to top
-                            if len(self.re_instance._plan_stack):
+                            if len(self.state_cache.plan_stack):
                                 stashed_exception = e
                                 continue
                             # no plans left and still an unhandled exception
@@ -516,15 +495,15 @@ class SingleRunExecutor:
                     # The normal case of clean operation
                     else:
                         try:
-                            msg = self.re_instance._plan_stack[-1].send(resp)
+                            msg = self.state_cache.plan_stack[-1].send(resp)
                         # We have exhausted the top generator
                         except StopIteration:
                             # pop the dead generator go back to the top
-                            self.re_instance._plan_stack.pop()
+                            self.state_cache.plan_stack.pop()
                             # we have killed the current plan, do not give
                             # it a new response
                             resp = sentinel
-                            if len(self.re_instance._plan_stack):
+                            if len(self.state_cache.plan_stack):
                                 continue
                             # or reraise to get out of the infinite loop
                             else:
@@ -533,11 +512,11 @@ class SingleRunExecutor:
                         except Exception as e:
                             # pop the dead plan, stash the exception and
                             # go to the top of the loop
-                            self.re_instance._plan_stack.pop()
+                            self.state_cache.plan_stack.pop()
                             # we have killed the current plan, do not give
                             # it a new response
                             resp = sentinel
-                            if len(self.re_instance._plan_stack):
+                            if len(self.state_cache.plan_stack):
                                 stashed_exception = e
                                 continue
                             # or reraise to get out of the infinite loop
@@ -545,8 +524,8 @@ class SingleRunExecutor:
                                 raise
 
                     # if we have a message hook, call it
-                    if self.re_instance.msg_hook is not None:
-                        self.re_instance.msg_hook(msg)
+                    if self.cb_cache.msg_hook is not None:
+                        self.cb_cache.msg_hook(msg)
                     debug(
                         "%s(%r, *%r **%r, run=%r)",
                         msg.command,
@@ -558,20 +537,22 @@ class SingleRunExecutor:
                     )
 
                     # update the running set of all objects we have seen
-                    self.objs_seen.add(msg.obj)
+                    self.objs_cache.objs_seen.add(msg.obj)
 
                     # if this message can be cached for rewinding, cache it
                     if (
-                        self.re_instance._msg_cache is not None
-                        and self.re_instance._rewindable_flag
-                        and msg.command not in self._UNCACHEABLE_COMMANDS
+                        self.state_cache.msg_cache is not None
+                        and self.state_cache.rewindable_flag
+                        and msg.command not in _UNCACHEABLE_COMMANDS
                     ):
                         # We have a checkpoint.
-                        self.re_instance._msg_cache.append(msg)
+                        self.state_cache.msg_cache.append(msg)
 
                     # try to look up the coroutine to execute the command
                     if (
-                        coro := self.re_instance._command_registry.get(msg.command, key_absence_sentinel := object())
+                        coro := self.state_cache.command_registry.get(
+                            msg.command, key_absence_sentinel := object()
+                        )
                     ) is key_absence_sentinel:
                         # flag invalid command
                         # and return to the top of the loop
@@ -608,22 +589,22 @@ class SingleRunExecutor:
                         "KeyboardInterrupt. Intercepting and triggering "
                         "a HALT."
                     )
-                    await self.re_instance._halt_coro()
+                    await self.cb_cache.halt_coro()
                 except asyncio.CancelledError as e:
-                    if self.re_instance._state == "pausing":
+                    if self.cb_cache.get_state() == "pausing":
                         # if we got a CancelledError and we are in the
                         # 'pausing' state clear the run permit and
                         # bounce to the top
-                        self.re_instance._run_permit.clear()
+                        self.state_cache.run_permit.clear()
                         continue
-                    if self.re_instance._state in ("halting", "stopping", "aborting"):
+                    if self.cb_cache.get_state() in ("halting", "stopping", "aborting"):
                         # if we got this while just keep going in tear-down
                         exception_map = {"halting": PlanHalt, "stopping": RequestStop, "aborting": RequestAbort}
                         # if the exception is not set bounce to the top
                         if stashed_exception is None:
-                            stashed_exception = exception_map[self.re_instance.state]
+                            stashed_exception = exception_map[self.cb_cache.get_state()]
                         continue
-                    if self.re_instance._state == "suspending":
+                    if self.cb_cache.get_state() == "suspending":
                         # just bounce to the top
                         continue
                     # if we are handling this twice, raise and leave the plans
@@ -638,40 +619,40 @@ class SingleRunExecutor:
                     # if we poped a response and did not pop a plan, we need
                     # to put the new response back on the stack
                     if resp is not sentinel:
-                        self.re_instance._response_stack.append(new_response)
+                        self.state_cache.response_stack.append(new_response)
 
         except StopIteration as e:
-            self.re_instance._exit_status = "success"
+            self.state_cache.exit_status = "success"
             plan_return = e.value
             # TODO Is the sleep here necessary?
             await asyncio.sleep(0)
         except RequestStop:
-            self.re_instance._exit_status = "success"
+            self.state_cache.exit_status = "success"
             # TODO Is the sleep here necessary?
             await asyncio.sleep(0)
         except (FailedPause, RequestAbort, asyncio.CancelledError, PlanHalt):
-            self.re_instance._exit_status = "abort"
+            self.state_cache.exit_status = "abort"
             # TODO Is the sleep here necessary?
             await asyncio.sleep(0)
-            self.re_instance.log.exception("Run aborted")
+            self.log.exception("Run aborted")
         except GeneratorExit as err:
-            self.re_instance._exit_status = "fail"  # Exception raises during 'running'
+            self.state_cache.exit_status = "fail"  # Exception raises during 'running'
             exit_reason = str(err)
             raise ValueError from err
         except Exception as err:
-            self.re_instance._exit_status = "fail"  # Exception raises during 'running'
+            self.state_cache.exit_status = "fail"  # Exception raises during 'running'
             exit_reason = str(err)
-            self.re_instance.log.exception("Run aborted")
+            self.log.exception("Run aborted")
             raise err
         finally:
             if not exit_reason:
-                exit_reason = self.re_instance._reason
+                exit_reason = self.state_cache.reason
             # Some done_callbacks may still be alive in other threads.
             # Block them from creating new 'failed status' tasks on the loop.
-            self.re_instance._pardon_failures.set()
+            self.state_cache.pardon_failures.set()
             # call stop() on every movable object we ever set()
-            await self.re_instance._stop_movable_objects(success=True)
-            for current_run in self.re_instance._run_bundlers.values():
+            await self.cb_cache.stop_movable_objects(success=True)
+            for current_run in self.objs_cache.run_bundlers.values():
                 # Clear any uncleared monitoring callbacks.
                 current_run.clear_monitors()
                 # Try to collect any flyers that were kicked off but
@@ -679,34 +660,39 @@ class SingleRunExecutor:
                 # collection. We swallow errors.
                 await current_run.backstop_collect()
             # in case we were interrupted between 'stage' and 'unstage'
-            for obj in list(self.re_instance._staged):
+            for obj in list(self.objs_cache.staged):
                 try:
                     obj.unstage()
                 except Exception:
-                    self.re_instance.log.exception("Failed to unstage %r.", obj)
-                self.re_instance._staged.remove(obj)
+                    self.log.exception("Failed to unstage %r.", obj)
+                self.objs_cache.staged.remove(obj)
 
             sys.stdout.flush()
             # Emit RunStop if necessary.
-            for key, current_run in self.re_instance._run_bundlers.items():
+            for key, current_run in self.objs_cache.run_bundlers.items():
                 if current_run.run_is_open:
                     try:
                         await current_run.close_run(
-                            Msg("close_run", exit_status=self.re_instance._exit_status, reason=exit_reason, run_id=key)
+                            Msg(
+                                "close_run",
+                                exit_status=self.state_cache.exit_status,
+                                reason=exit_reason,
+                                run_id=key,
+                            )
                         )
                     except Exception:
-                        self.re_instance.log.error("Failed to close run %r.", current_run)
-            self.re_instance._run_bundlers.clear()
+                        self.log.error("Failed to close run %r.", current_run)
+            self.objs_cache.run_bundlers.clear()
 
-            for p in self.re_instance._plan_stack:
+            for p in self.state_cache.plan_stack:
                 try:
                     p.close()
                 except RuntimeError:
                     print(f"The plan {p!r} tried to yield a value on close.  Please fix your plan.")
 
-            self.re_instance._state = "idle"
+            self.cb_cache.set_state("idle")
 
-        self.re_instance.log.info("Cleaned up from plan %r", self.re_instance._plan)
+        self.log.info("Cleaned up from plan %r", self.state_cache.plan)
         if isinstance(stashed_exception, asyncio.CancelledError):
             raise stashed_exception
         return plan_return
