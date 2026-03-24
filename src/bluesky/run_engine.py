@@ -395,7 +395,7 @@ class SingleRunExecutor:
                     # resting state.
                     assert self.cb_cache.get_state() == "pausing"
                     # Remove any monitoring callbacks, but keep refs in
-                    # self.re_instance._monitor_params to re-instate them later.
+                    # monitor_params to re-instate them later.
                     for current_run in self.objs_cache.run_bundlers.values():
                         await current_run.suspend_monitors()
                     # During pause, all motors should be stopped. Call stop()
@@ -436,7 +436,7 @@ class SingleRunExecutor:
                     # the next message from the top of the generator stack in
                     # case there has been a pause requested.  Without this the
                     # next message after the pause may be processed first on
-                    # resume (instead of the first message in self.re_instance._msg_cache).
+                    # resume (instead of the first message in msg_cache).
                     # This await also gives the co-routine for requesting
                     # suspends a chance to run.
 
@@ -1556,7 +1556,7 @@ class RunEngine:
                     return self.NO_PLAN_RETURN
             # The _run task is waiting on this Event. Let is continue.
             for sre in self._sre_objs:
-                self.loop.call_soon_threadsafe(sre.re_instance._run_permit.set)
+                self.loop.call_soon_threadsafe(sre.state_cache.run_permit.set)
             try:
                 # Block until plan is complete or exception is raised.
                 try:
