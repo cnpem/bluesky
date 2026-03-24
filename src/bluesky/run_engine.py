@@ -244,6 +244,13 @@ class _StateCache:
     task: asyncio.Task | None = field(init=False, default=None)
     """The current asyncio task running the plan."""
 
+    # TODO: plan is used only for
+    # metadata introspection; access said
+    # metadata directly without stashing
+    # the plan here
+    plan: asyncio.Task | None = field(init=False, default=None)
+    """The current running plan."""
+
     run_permit: asyncio.Event = field(init=False)
     """Run permit event that controls when the RunEngine is allowed to run."""
 
@@ -972,11 +979,6 @@ class RunEngine:
         self._task = None  # asyncio.Task associated with call to self._run
         self._task_fut = None  # future proxy to the task above
 
-        # TODO: self._plan is used only for
-        # metadata introspection; access said
-        # metadata directly without stashing
-        # the plan here
-        self._plan = None  # the plan instance from __call__
         self._require_stream_declaration = False
         self._command_registry = {
             "declare_stream": self._declare_stream,
@@ -1203,7 +1205,6 @@ class RunEngine:
         self._deferred_pause_requested = False
         self._run_start_uids.clear()
         self._interrupted = False
-        self._plan = None
         self._task = None
         self._task_fut = None
 
@@ -1211,6 +1212,7 @@ class RunEngine:
         self.objs_cache.staged.clear()
         self.objs_cache.movable_objs_touched.clear()
 
+        self.state_cache.plan = None
         self.state_cache.plan_stack = deque()
         self.state_cache.msg_cache = deque()
         self.state_cache.response_stack = deque()
@@ -1429,7 +1431,7 @@ class RunEngine:
             for func in funcs:
                 self.objs_cache.temp_callback_ids.add(self.subscribe(func, name))
 
-        self._plan = plan  # this ref is just used for metadata introspection
+        self.state_cache.plan = plan  # this ref is just used for metadata introspection
         self._metadata_per_call.update(metadata_kw)
 
         gen = ensure_generator(plan)
@@ -1441,7 +1443,7 @@ class RunEngine:
         if futs:
             self.state_cache.plan_stack.append(single_gen(Msg("wait_for", None, futs)))
             self.state_cache.response_stack.append(None)
-        self.log.info("Executing plan %r", self._plan)
+        self.log.info("Executing plan %r", plan)
 
         def _build_task():
             # make sure _run will block at the top
@@ -2010,15 +2012,15 @@ class RunEngine:
         self.md["scan_id"] = await maybe_await(self.scan_id_source(self.md))
 
         # For metadata below, info about plan passed to self.__call__ for.
-        plan_type = type(self._plan).__name__
-        plan_name = getattr(self._plan, "__name__", "")
+        plan_type = type(self.state_cache.plan).__name__
+        plan_name = getattr(self.state_cache.plan, "__name__", "")
 
         # Combine metadata, in order of decreasing precedence:
         md = ChainMap(
             self._metadata_per_call,  # from kwargs to self.__call__
             msg.kwargs,  # from 'open_run' Msg
             {
-                "plan_type": plan_type,  # computed from self._plan
+                "plan_type": plan_type,  # computed from self.state_cache.plan
                 "plan_name": plan_name,
             },
             self.md,
