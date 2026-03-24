@@ -1454,7 +1454,7 @@ class RunEngine:
                 state_cache=self.state_cache,
                 cb_cache=self.cb_cache,
                 state_lock=self._state_lock,
-                logger=self.log
+                logger=self.log,
             )
             self._sre_objs.add(sre)
             self._task_fut = asyncio.run_coroutine_threadsafe(sre.run(), loop=self.loop)
