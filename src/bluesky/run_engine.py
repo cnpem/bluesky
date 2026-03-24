@@ -292,6 +292,11 @@ class _InternalCallbackCache:
     functions serve as a way for a two-way
     communcation between the RunEngine and SingleRunExecutors.
     """
+    set_state: Callable[[str], None]
+    """Callback to be called with the current state of the RunEngine whenever it changes."""
+
+    get_state: Callable[[], str]
+    """Callback to be called to get the current state of the RunEngine."""
 
     halt_coro: Callable[[], CoroutineType[typing.Any, typing.Any, typing.Any]]
     """Coroutine function to be called to halt the RunEngine."""
