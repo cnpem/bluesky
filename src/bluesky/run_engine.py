@@ -1450,6 +1450,7 @@ class RunEngine:
             self.state_cache.run_permit.clear()
             self.state_cache.blocking_event.clear()
             self.state_cache.reason = ""
+            self.cb_cache.msg_hook = self.msg_hook
             sre = SingleRunExecutor(
                 objs_cache=self.objs_cache,
                 state_cache=self.state_cache,
