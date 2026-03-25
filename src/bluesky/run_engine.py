@@ -355,7 +355,6 @@ class SingleRunExecutor:
         self.cb_cache = cb_cache
         self._state_lock = state_lock
         self.log = logger
-        self.NO_PLAN_RETURN = object()
         self.task: asyncio.Task[typing.Any] | None = None
 
     async def run(self):
@@ -388,7 +387,7 @@ class SingleRunExecutor:
         debug = msg_logger.debug
         # sentinel to decide if need to add to the response stack or not
         sentinel = object()
-        plan_return = self.NO_PLAN_RETURN
+        plan_return = None
         exit_reason = ""
         try:
             self.cb_cache.set_state("running")
