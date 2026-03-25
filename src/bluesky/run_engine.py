@@ -1434,18 +1434,17 @@ class RunEngine:
             )
             self._sre_objs.add(sre)
             self._task_fut = asyncio.run_coroutine_threadsafe(sre.run(), loop=self.loop)
+
             def set_block_event(_: concurrent.futures.Future[typing.Any]) -> None:
                 self._blocking_event.set()
+
             self._task_fut.add_done_callback(set_block_event)
 
         return _build_task
 
-    def run(self,
-            plan: typing.Iterable[Msg],
-            subs: Subscribers | None = None,
-            /,
-            **metadata_kw: typing.Any
-        ) -> "concurrent.futures.Future[RunEngineResult | tuple[str, ...]]":
+    def run(
+        self, plan: typing.Iterable[Msg], subs: Subscribers | None = None, /, **metadata_kw: typing.Any
+    ) -> "concurrent.futures.Future[RunEngineResult | tuple[str, ...]]":
         """Execute a plan asynchronously.
 
         Any keyword arguments will be interpreted as metadata and recorded with
