@@ -247,7 +247,7 @@ class _StateCache:
     # metadata introspection; access said
     # metadata directly without stashing
     # the plan here
-    plan: asyncio.Task | None = field(init=False, default=None)
+    plan: typing.Iterable[Msg] | None = field(init=False, default=None)
     """The current running plan."""
 
     run_permit: asyncio.Event = field(init=False)
@@ -1036,7 +1036,7 @@ class RunEngine:
             set_state=self._set_state,
             get_state=self._get_state,
             halt_coro=self._halt_coro,
-            stop_movable_objects=self._stop_movable_objects,
+            stop_movable_objects=self._stop_movable_objects,  # type: ignore
             reset_checkpoint_state=self._reset_checkpoint_state_meth,
         )
 
@@ -1182,11 +1182,11 @@ class RunEngine:
         return tuple(self._suspenders)
 
     @property
-    def verbose(self) -> bool:
+    def verbose(self):
         return not self.log.disabled
 
     @verbose.setter
-    def verbose(self, value: bool) -> None:
+    def verbose(self, value):
         self.log.disabled = not value
 
     @property
@@ -1433,12 +1433,12 @@ class RunEngine:
                 logger=self.log,
             )
             self._sre_objs.add(sre)
-            self._task_fut = asyncio.run_coroutine_threadsafe(sre.run(), loop=self.loop)
+            self._task_fut = asyncio.run_coroutine_threadsafe(sre.run(), loop=self.loop)  # type: ignore[assignment]
 
             def set_block_event(_: concurrent.futures.Future[typing.Any]) -> None:
                 self._blocking_event.set()
 
-            self._task_fut.add_done_callback(set_block_event)
+            self._task_fut.add_done_callback(set_block_event)  # type: ignore[attr-defined]
 
         return _build_task
 
@@ -1487,7 +1487,7 @@ class RunEngine:
         _build_task()
         for sre in self._sre_objs:
             self.loop.call_soon_threadsafe(sre.state_cache.run_permit.set)
-        return self._task_fut
+        return self._task_fut  # type: ignore[return-value]
 
     def __call__(
         self,
